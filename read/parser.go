@@ -823,7 +823,11 @@ type dwarfType interface {
 	Size() uint64
 	// Fields returns a list of fields within the object, in increasing offset order.
 	Fields() []Field
-	
+	// dwarfFields returns a list of fields within the type.
+	// The list is "flattened", so only base & ptr types remain. (TODO: and func, for now)
+	// We call this dynamically instead of building it for each type
+	// when the type is constructed, so we avoid constructing this list for
+	// crazy types that are never instantiated, e.g. [1000000000]byte.
 	dwarfFields() []dwarfTypeMember
 }
 type dwarfTypeImpl struct {
@@ -940,8 +944,13 @@ func (t *dwarfPtrType) dwarfFields() []dwarfTypeMember {
 	return t.dFields
 }
 
-var dwarfInt dwarfType = &dwarfBaseType{dwarfTypeImpl{"int", 8, nil, nil}, dw_ate_signed}
-var dwarfIntPtr dwarfType = &dwarfPtrType{dwarfTypeImpl{"*int", 8, nil, nil}, dwarfInt}
+// We treat a func as a *uintptr.  (It is actually a pointer to a closure, which is
+// in turn a pointer to code.)
+// TODO: how do we deduce types of closure parameters???  We could look at the code
+// pointer and figure it out somehow.
+// TODO: parameterize size by d.PtrSize.
+var dwarfCodePtr dwarfType = &dwarfBaseType{dwarfTypeImpl{"<codeptr>",8,nil,nil}, dw_ate_unsigned}
+var dwarfFunc dwarfType = &dwarfPtrType{dwarfTypeImpl{"*<closure>", 8, nil, nil}, dwarfCodePtr}
 
 func (t *dwarfFuncType) Fields() []Field {
 	if t.fields == nil {
@@ -952,8 +961,7 @@ func (t *dwarfFuncType) Fields() []Field {
 
 func (t *dwarfFuncType) dwarfFields() []dwarfTypeMember {
 	if t.dFields == nil {
-		// TODO: real type
-		t.dFields = append(t.dFields, dwarfTypeMember{0, "", dwarfIntPtr})
+		t.dFields = append(t.dFields, dwarfTypeMember{0, "", dwarfFunc})
 	}
 	return t.dFields
 }
@@ -1144,8 +1152,12 @@ func dwarfTypeMap(d *Dump, w *dwarf.Data) map[dwarf.Offset]dwarfType {
 			i := e.Val(dwarf.AttrType)
 			if i != nil {
 				t[e.Offset].(*dwarfPtrType).elem = t[i.(dwarf.Offset)]
+			} else {
+				// The only nil cases are unsafe.Pointer and reflect.iword
+				if t[e.Offset].Name() != "unsafe.Pointer" {
+					log.Fatalf("pointer without base pointer %s", t[e.Offset].Name())
+				}
 			}
-			// The only nil cases are unsafe.Pointer and reflect.iword
 		case dwarf.TagArrayType:
 			t[e.Offset].(*dwarfArrayType).elem = t[e.Val(dwarf.AttrType).(dwarf.Offset)]
 		case dwarf.TagStructType:
@@ -1172,6 +1184,7 @@ func dwarfTypeMap(d *Dump, w *dwarf.Data) map[dwarf.Offset]dwarfType {
 	}
 	
 	// TODO: remove
+	if false {
 	for _, typ := range t {
 		fmt.Println(typ.Name())
 		n := 0
@@ -1184,6 +1197,7 @@ func dwarfTypeMap(d *Dump, w *dwarf.Data) map[dwarf.Offset]dwarfType {
 			n++
 			if n > 100 { break }
 		}
+	}
 	}
 	return t
 }
@@ -1332,7 +1346,8 @@ func globalRoots(d *Dump, w *dwarf.Data, t map[dwarf.Offset]dwarfType) []dwarfTy
 		}
 		loc := readPtr(d, locexpr[1:])
 		if typ == nil {
-			// lots of non-Go global symbols hit here (rodata, reflect.cvtFloat·f, ...)
+			// lots of non-Go global symbols hit here (rodata, type..gc,
+			// static function closures, ...)
 			fmt.Printf("nontyped global %s %d\n", name, loc)
 			continue
 		}
@@ -1420,8 +1435,11 @@ func typePropagate(d *Dump, execname string) {
 
 	// map from heap address to type at that address
 	htypes := map[uint64]dwarfType{}
-	_ = htypes // TODO: remove
 
+	// set of addresses from which we still need to propagate
+	var addrq []uint64
+
+	// apply globals
 	for _, r := range globalRoots(d, w, t) {
 		var off uint64
 		var b []byte
@@ -1433,19 +1451,88 @@ func typePropagate(d *Dump, execname string) {
 			b = d.Bss.Data
 			off = r.offset - d.Bss.Addr
 		default:
-			log.Fatalf("global address %d not in data or bss", r.offset)
+			log.Printf("global address %s %x not in data [%x %x] or bss [%x %x]", r.name, r.offset, d.Data.Addr, d.Data.Addr+uint64(len(d.Data.Data)), d.Bss.Addr, d.Bss.Addr+uint64(len(d.Bss.Data)))
+			continue
 		}
-		// TODO: remove
-		_ = off
-		_ = b
-		//for _, f := range r.type_.dwarfFields() {
-		//}
+		for _, f := range r.type_.dwarfFields() {
+			// we've squashed typedef, struct, array at this point.
+			switch t := f.type_.(type) {
+			case *dwarfPtrType:
+				p := readPtr(d, b[off + f.offset:])
+				if t.elem != nil {
+					// t.elem is nil for unsafe.Pointer
+					if setType(d, htypes, p, t.elem) {
+						addrq = append(addrq, p)
+					}
+				}
+			case *dwarfFuncType:
+				// TODO
+				//setType(d, htypes, off + f.offset, f.elem)
+			case *dwarfBaseType:
+				// nothing to do
+			default:
+				log.Fatalf("unknown type for field %#v", f)
+			}
+		}
 	}
 
-	// apply globals
-	
-
 	// apply locals and args
+	
+	// propagate types
+	fmt.Println("propagating")
+	for len(addrq) > 0 {
+		addr := addrq[0]
+		addrq = addrq[1:]
+		typ := htypes[addr]
+		
+		obj := d.FindObj(addr)
+		if obj == ObjNil {
+			// TODO: what is going on here?
+			log.Printf("pointer not to valid heap object %x %s", addr, typ.Name())
+			continue
+		}
+		data := d.Contents(obj)
+		for _, f := range typ.dwarfFields() {
+			switch t := f.type_.(type) {
+			case *dwarfPtrType:
+				if t.elem == nil {
+					// t.elem is nil for unsafe.Pointer
+					break
+				}
+				p := readPtr(d, data[addr + f.offset - d.Addr(obj):])
+				if setType(d, htypes, p, t.elem) {
+					addrq = append(addrq, p)
+				}
+			}
+		}
+	}
+
+	// update types of known objects
+	for i := 0; i < d.NumObjects(); i++ {
+		x := ObjId(i)
+		addr := d.Addr(x)
+		if t, ok := htypes[addr]; ok {
+			ft := &FullType{len(d.FTList), t.Size(), "", t.Name(), nil}
+			d.FTList = append(d.FTList, ft)
+			d.objects[x].Ft = ft
+		}
+	}
+}
+
+func setType(d *Dump, htypes map[uint64]dwarfType, addr uint64, typ dwarfType) bool {
+	if addr < d.HeapStart || addr >= d.HeapEnd {
+		return false
+	}
+	if oldtyp, ok := htypes[addr]; ok {
+		if typ != oldtyp {
+			log.Printf("type mismatch in heap %x %s %s", addr, oldtyp.Name(), typ.Name())
+		}
+		// TODO: containment should be allowed.  Pick bigger type.
+		return false
+	}
+	htypes[addr] = typ
+	fmt.Printf("%x: %s\n", addr, typ.Name())
+	return true
 }
 
 // Names the fields it can for better debugging output
@@ -1567,7 +1654,7 @@ func nameWithDwarf(d *Dump, execname string) {
 	}
 }
 
-func link(d *Dump) {
+func link1(d *Dump) {
 	// sort objects in increasing address order
 	sort.Sort(byAddr(d.objects))
 
@@ -1585,7 +1672,9 @@ func link(d *Dump) {
 			d.idx[j] = ObjId(i)
 		}
 	}
+}
 
+func link2(d *Dump) {
 	// initialize some maps used for linking
 	frames := make(map[frameKey]*StackFrame, len(d.Frames))
 	for _, x := range d.Frames {
@@ -1742,13 +1831,15 @@ func (a byAddr) Less(i, j int) bool { return a[i].Addr < a[j].Addr }
 
 func Read(dumpname, execname string) *Dump {
 	d := rawRead(dumpname)
+	link1(d)
 	if execname != "" {
+		typePropagate(d, execname)
 		nameWithDwarf(d, execname)
 	} else {
 		nameFallback(d)
 	}
 	nameFullTypes(d)
-	link(d)
+	link2(d)
 	return d
 }
 
