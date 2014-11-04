@@ -669,7 +669,6 @@ func rawRead(filename string) *Dump {
 			addr := readUint64(r)
 			typaddr := readUint64(r)
 			d.ItabMap[addr] = typaddr
-			fmt.Printf("itab %x %x\n", addr, typaddr)
 		case tagOSThread:
 			t := &OSThread{}
 			t.addr = readUint64(r)
@@ -1104,7 +1103,6 @@ func dwarfTypeMap(d *Dump, w *dwarf.Data) map[dwarf.Offset]dwarfType {
 			x := new(dwarfStructType)
 			x.name = e.Val(dwarf.AttrName).(string)
 			x.size = uint64(e.Val(dwarf.AttrByteSize).(int64))
-			log.Printf("making struct %s", x.name)
 			for _, a := range adjTypeNames {
 				if k := a.matcher.FindStringSubmatch(x.name); k != nil {
 					var i []interface{}
@@ -1350,7 +1348,7 @@ func globalRoots(d *Dump, w *dwarf.Data, t map[dwarf.Offset]dwarfType) []dwarfTy
 		if typ == nil {
 			// lots of non-Go global symbols hit here (rodata, type..gc,
 			// static function closures, ...)
-			fmt.Printf("nontyped global %s %d\n", name, loc)
+			//fmt.Printf("nontyped global %s %d\n", name, loc)
 			continue
 		}
 		roots = append(roots, dwarfTypeMember{loc, name, typ})
@@ -1528,7 +1526,7 @@ func typePropagate(d *Dump, execname string) {
 			b = d.Bss.Data
 			off = r.offset - d.Bss.Addr
 		default:
-			log.Printf("global address %s %x not in data [%x %x] or bss [%x %x]", r.name, r.offset, d.Data.Addr, d.Data.Addr+uint64(len(d.Data.Data)), d.Bss.Addr, d.Bss.Addr+uint64(len(d.Bss.Data)))
+			//log.Printf("global address %s %x not in data [%x %x] or bss [%x %x]", r.name, r.offset, d.Data.Addr, d.Data.Addr+uint64(len(d.Data.Data)), d.Bss.Addr, d.Bss.Addr+uint64(len(d.Bss.Data)))
 			continue
 		}
 		for _, f := range r.type_.dwarfFields() {
@@ -1557,30 +1555,27 @@ func typePropagate(d *Dump, execname string) {
 	for _, g := range d.Goroutines {
 		var c *StackFrame
 		for r := g.Bos; r != nil; r = r.Parent {
-			log.Printf("func %s %x", r.Name, len(r.Data))
+			//log.Printf("func %s %x", r.Name, len(r.Data))
 			for k := range live {
 				delete(live, k)
 			}
 			for _, f := range r.Fields {
 				switch f.Kind {
 				case FieldKindPtr:
-					log.Printf("liveptr %x\n", f.Offset)
+					//log.Printf("liveptr %x\n", f.Offset)
 					live[f.Offset] = true
 				case FieldKindIface, FieldKindEface:
-					log.Printf("liveiface %x %x\n", f.Offset, f.Offset+d.PtrSize)
+					//log.Printf("liveiface %x %x\n", f.Offset, f.Offset+d.PtrSize)
 					live[f.Offset] = true
 					live[f.Offset+d.PtrSize] = true
 				}
 			}
-			for i := 0; i < len(r.Data); i+=8 {
-				log.Printf("%x: %x %x %x %x %x %x %x %x", i, r.Data[i+0],r.Data[i+1],r.Data[i+2],r.Data[i+3],r.Data[i+4],r.Data[i+5],r.Data[i+6],r.Data[i+7])
-			}
 
 			// find live pointers, propagate types along them
 			for _, local := range layouts[r.Name].locals {
-				log.Printf("  local %s @ %x", local.name, uint64(len(r.Data))-local.offset)
+				//log.Printf("  local %s @ %x", local.name, uint64(len(r.Data))-local.offset)
 				for _, f := range local.type_.dwarfFields() {
-					log.Printf("    field %s @ %x", f.name, uint64(len(r.Data))-local.offset+f.offset)
+					//log.Printf("    field %s @ %x", f.name, uint64(len(r.Data))-local.offset+f.offset)
 					switch t := f.type_.(type) {
 					case *dwarfPtrType:
 						if t.elem == nil {
@@ -1605,7 +1600,7 @@ func typePropagate(d *Dump, execname string) {
 			if c != nil {
 				// find live pointers in outargs section
 				for _, arg := range layouts[c.Name].args {
-					log.Printf("  arg %s @ %x", arg.name, arg.offset)
+					//log.Printf("  arg %s @ %x", arg.name, arg.offset)
 					for _, f := range arg.type_.dwarfFields() {
 						switch t := f.type_.(type) {
 						case *dwarfPtrType:
@@ -1642,8 +1637,8 @@ func typePropagate(d *Dump, execname string) {
 		
 		obj := d.FindObj(addr)
 		if obj == ObjNil {
-			// TODO: what is going on here?
-			log.Printf("pointer not to valid heap object %x %s", addr, typ.Name())
+			// Can happen for pointers into stacks (from defers, say)
+			//log.Printf("pointer %x is not to valid heap object addr=%s", addr, typ.Name())
 			continue
 		}
 		base := d.Addr(obj)
@@ -1689,24 +1684,23 @@ func setType(d *Dump, htypes map[uint64]dwarfType, addr uint64, typ dwarfType) b
 	if addr < d.HeapStart || addr >= d.HeapEnd {
 		return false
 	}
-	if true {
-		obj := d.FindObj(addr)
-		if obj != ObjNil {
-			if typ.Size() > d.Size(obj) {
-				log.Printf("%x: objsize:%d typsize:%d typ:%s", addr, d.Size(obj), typ.Size(), typ.Name())
-				panic("foo")
-			}
+	obj := d.FindObj(addr)
+	if obj != ObjNil {
+		if addr + typ.Size() > d.Addr(obj) + d.Size(obj) {
+			log.Fatalf("dwarf type larger than object addr=%x typ=%s typsize=%x objaddr=%x objsize=%x", addr, typ.Name(), typ.Size(), d.Addr(obj), d.Size(obj))
 		}
 	}
 	if oldtyp, ok := htypes[addr]; ok {
 		if typ != oldtyp {
+			// this happens for channels of struct{}, the buf points back to the
+			// channel itself.
 			log.Printf("type mismatch in heap %x %s %s", addr, oldtyp.Name(), typ.Name())
 		}
 		// TODO: containment should be allowed.  Pick bigger type.
 		return false
 	}
 	htypes[addr] = typ
-	fmt.Printf("%x: %s\n", addr, typ.Name())
+	//fmt.Printf("%x: %s\n", addr, typ.Name())
 	return true
 }
 
