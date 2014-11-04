@@ -669,7 +669,7 @@ func rawRead(filename string) *Dump {
 			addr := readUint64(r)
 			typaddr := readUint64(r)
 			d.ItabMap[addr] = typaddr
-			//fmt.Printf("itab %x %x\n", addr, typaddr)
+			fmt.Printf("itab %x %x\n", addr, typaddr)
 		case tagOSThread:
 			t := &OSThread{}
 			t.addr = readUint64(r)
@@ -1104,6 +1104,7 @@ func dwarfTypeMap(d *Dump, w *dwarf.Data) map[dwarf.Offset]dwarfType {
 			x := new(dwarfStructType)
 			x.name = e.Val(dwarf.AttrName).(string)
 			x.size = uint64(e.Val(dwarf.AttrByteSize).(int64))
+			log.Printf("making struct %s", x.name)
 			for _, a := range adjTypeNames {
 				if k := a.matcher.FindStringSubmatch(x.name); k != nil {
 					var i []interface{}
@@ -1154,7 +1155,8 @@ func dwarfTypeMap(d *Dump, w *dwarf.Data) map[dwarf.Offset]dwarfType {
 				t[e.Offset].(*dwarfPtrType).elem = t[i.(dwarf.Offset)]
 			} else {
 				// The only nil cases are unsafe.Pointer and reflect.iword
-				if t[e.Offset].Name() != "unsafe.Pointer" {
+				if t[e.Offset].Name() != "unsafe.Pointer" &&
+					t[e.Offset].Name() != "crypto/x509._Ctype_CFTypeRef" {
 					log.Fatalf("pointer without base pointer %s", t[e.Offset].Name())
 				}
 			}
@@ -1356,6 +1358,81 @@ func globalRoots(d *Dump, w *dwarf.Data, t map[dwarf.Offset]dwarfType) []dwarfTy
 	return roots
 }
 
+type frameLayout struct {
+	// offset is distance down from FP
+	locals []dwarfTypeMember
+	// offset is distance up from first arg slot
+	args []dwarfTypeMember
+}
+
+// frameLayouts returns a map from function names to frameLayouts describing that function's stack frame.
+func frameLayouts(d *Dump, w *dwarf.Data, t map[dwarf.Offset]dwarfType) map[string]frameLayout {
+	m := map[string]frameLayout{}
+	var locals []dwarfTypeMember
+	var args []dwarfTypeMember
+	r := w.Reader()
+	var funcname string
+	for {
+		e, err := r.Next()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if e == nil {
+			break
+		}
+		switch e.Tag {
+		case dwarf.TagSubprogram:
+			if funcname != "" {
+				m[funcname] = frameLayout{locals, args}
+				locals = nil
+				args = nil
+			}
+			funcname = e.Val(dwarf.AttrName).(string)
+		case dwarf.TagVariable:
+			name := e.Val(dwarf.AttrName).(string)
+			typ := t[e.Val(dwarf.AttrType).(dwarf.Offset)]
+			loc := e.Val(dwarf.AttrLocation).([]uint8)
+			if len(loc) == 0 || loc[0] != dw_op_call_frame_cfa {
+				continue
+			}
+			var offset int64
+			if len(loc) == 1 {
+				offset = 0
+			} else if len(loc) >= 3 && loc[1] == dw_op_consts && loc[len(loc)-1] == dw_op_plus {
+				loc, offset = readSleb(loc[2 : len(loc)-1])
+				if len(loc) != 0 {
+					continue
+				}
+			}
+			locals = append(locals, dwarfTypeMember{uint64(-offset), name, typ})
+		case dwarf.TagFormalParameter:
+			if e.Val(dwarf.AttrName) == nil {
+				continue
+			}
+			name := e.Val(dwarf.AttrName).(string)
+			typ := t[e.Val(dwarf.AttrType).(dwarf.Offset)]
+			loc := e.Val(dwarf.AttrLocation).([]uint8)
+			if len(loc) == 0 || loc[0] != dw_op_call_frame_cfa {
+				continue
+			}
+			var offset int64
+			if len(loc) == 1 {
+				offset = 0
+			} else if len(loc) >= 3 && loc[1] == dw_op_consts && loc[len(loc)-1] == dw_op_plus {
+				loc, offset = readSleb(loc[2 : len(loc)-1])
+				if len(loc) != 0 {
+					continue
+				}
+			}
+			args = append(args, dwarfTypeMember{uint64(offset), name, typ})
+		}
+	}
+	if funcname != "" {
+		m[funcname] = frameLayout{locals, args}
+	}
+	return m
+}
+
 // stack frames may be zero-sized, so we add call depth
 // to the key to ensure uniqueness.
 type frameKey struct {
@@ -1439,7 +1516,7 @@ func typePropagate(d *Dump, execname string) {
 	// set of addresses from which we still need to propagate
 	var addrq []uint64
 
-	// apply globals
+	// set types of objects which are pointed to by globals
 	for _, r := range globalRoots(d, w, t) {
 		var off uint64
 		var b []byte
@@ -1465,9 +1542,6 @@ func typePropagate(d *Dump, execname string) {
 						addrq = append(addrq, p)
 					}
 				}
-			case *dwarfFuncType:
-				// TODO
-				//setType(d, htypes, off + f.offset, f.elem)
 			case *dwarfBaseType:
 				// nothing to do
 			default:
@@ -1476,13 +1550,94 @@ func typePropagate(d *Dump, execname string) {
 		}
 	}
 
-	// apply locals and args
+	// set types of objects which are pointed to by stacks
+	layouts := frameLayouts(d, w, t)
+	log.Printf("locals & args\n")
+	live := map[uint64]bool{}
+	for _, g := range d.Goroutines {
+		var c *StackFrame
+		for r := g.Bos; r != nil; r = r.Parent {
+			log.Printf("func %s %x", r.Name, len(r.Data))
+			for k := range live {
+				delete(live, k)
+			}
+			for _, f := range r.Fields {
+				switch f.Kind {
+				case FieldKindPtr:
+					log.Printf("liveptr %x\n", f.Offset)
+					live[f.Offset] = true
+				case FieldKindIface, FieldKindEface:
+					log.Printf("liveiface %x %x\n", f.Offset, f.Offset+d.PtrSize)
+					live[f.Offset] = true
+					live[f.Offset+d.PtrSize] = true
+				}
+			}
+			for i := 0; i < len(r.Data); i+=8 {
+				log.Printf("%x: %x %x %x %x %x %x %x %x", i, r.Data[i+0],r.Data[i+1],r.Data[i+2],r.Data[i+3],r.Data[i+4],r.Data[i+5],r.Data[i+6],r.Data[i+7])
+			}
+
+			// find live pointers, propagate types along them
+			for _, local := range layouts[r.Name].locals {
+				log.Printf("  local %s @ %x", local.name, uint64(len(r.Data))-local.offset)
+				for _, f := range local.type_.dwarfFields() {
+					log.Printf("    field %s @ %x", f.name, uint64(len(r.Data))-local.offset+f.offset)
+					switch t := f.type_.(type) {
+					case *dwarfPtrType:
+						if t.elem == nil {
+							// untyped pointer
+							continue
+						}
+						i := uint64(len(r.Data)) - local.offset + f.offset
+						if !live[i] {
+							continue
+						}
+						p := readPtr(d, r.Data[i:])
+						if setType(d, htypes, p, t.elem) {
+							addrq = append(addrq, p)
+						}
+					case *dwarfBaseType:
+						// nothing to do
+					default:
+						log.Fatalf("unknown type for field %#v", f)
+					}
+				}
+			}
+			if c != nil {
+				// find live pointers in outargs section
+				for _, arg := range layouts[c.Name].args {
+					log.Printf("  arg %s @ %x", arg.name, arg.offset)
+					for _, f := range arg.type_.dwarfFields() {
+						switch t := f.type_.(type) {
+						case *dwarfPtrType:
+							if t.elem == nil {
+								// untyped pointer
+								continue
+							}
+							i := arg.offset + f.offset
+							if !live[i] {
+								continue
+							}
+							p := readPtr(d, r.Data[i:])
+							if setType(d, htypes, p, t.elem) {
+								addrq = append(addrq, p)
+							}
+						case *dwarfBaseType:
+							// nothing to do
+						default:
+							log.Fatalf("unknown type for field %#v", f)
+						}
+					}
+				}
+			}
+			c = r
+		}
+	}
 	
 	// propagate types
-	fmt.Println("propagating")
+	log.Println("propagating")
 	for len(addrq) > 0 {
-		addr := addrq[0]
-		addrq = addrq[1:]
+		addr := addrq[len(addrq)-1]
+		addrq = addrq[:len(addrq)-1]
 		typ := htypes[addr]
 		
 		obj := d.FindObj(addr)
@@ -1491,15 +1646,21 @@ func typePropagate(d *Dump, execname string) {
 			log.Printf("pointer not to valid heap object %x %s", addr, typ.Name())
 			continue
 		}
+		base := d.Addr(obj)
 		data := d.Contents(obj)
+		if typ.Size() > uint64(len(data)) {
+			log.Fatalf("type=%s/%d is too big for object %d", typ.Name(), typ.Size(), len(data))
+		}
 		for _, f := range typ.dwarfFields() {
+			if f.offset >= uint64(len(data)) {
+				log.Fatalf("type too big for object %s %v %d", typ.Name(), f, typ.Size())
+			}
 			switch t := f.type_.(type) {
 			case *dwarfPtrType:
 				if t.elem == nil {
-					// t.elem is nil for unsafe.Pointer
 					break
 				}
-				p := readPtr(d, data[addr + f.offset - d.Addr(obj):])
+				p := readPtr(d, data[addr + f.offset - base:])
 				if setType(d, htypes, p, t.elem) {
 					addrq = append(addrq, p)
 				}
@@ -1508,12 +1669,17 @@ func typePropagate(d *Dump, execname string) {
 	}
 
 	// update types of known objects
+	dwarfToFull := map[dwarfType]*FullType{}
 	for i := 0; i < d.NumObjects(); i++ {
 		x := ObjId(i)
 		addr := d.Addr(x)
 		if t, ok := htypes[addr]; ok {
-			ft := &FullType{len(d.FTList), t.Size(), "", t.Name(), nil}
-			d.FTList = append(d.FTList, ft)
+			ft, ok := dwarfToFull[t]
+			if !ok {
+				ft = &FullType{len(d.FTList), t.Size(), "", t.Name(), nil}
+				d.FTList = append(d.FTList, ft)
+				dwarfToFull[t] = ft
+			}
 			d.objects[x].Ft = ft
 		}
 	}
@@ -1522,6 +1688,15 @@ func typePropagate(d *Dump, execname string) {
 func setType(d *Dump, htypes map[uint64]dwarfType, addr uint64, typ dwarfType) bool {
 	if addr < d.HeapStart || addr >= d.HeapEnd {
 		return false
+	}
+	if true {
+		obj := d.FindObj(addr)
+		if obj != ObjNil {
+			if typ.Size() > d.Size(obj) {
+				log.Printf("%x: objsize:%d typsize:%d typ:%s", addr, d.Size(obj), typ.Size(), typ.Name())
+				panic("foo")
+			}
+		}
 	}
 	if oldtyp, ok := htypes[addr]; ok {
 		if typ != oldtyp {
@@ -1672,18 +1847,11 @@ func link1(d *Dump) {
 			d.idx[j] = ObjId(i)
 		}
 	}
-}
 
-func link2(d *Dump) {
 	// initialize some maps used for linking
 	frames := make(map[frameKey]*StackFrame, len(d.Frames))
 	for _, x := range d.Frames {
 		frames[frameKey{x.Addr, x.Depth}] = x
-	}
-
-	// link stack frames to objects
-	for _, f := range d.Frames {
-		f.Edges = d.appendFields(f.Edges, f.Data, f.Fields)
 	}
 
 	// link up frames in sequence
@@ -1708,6 +1876,13 @@ func link2(d *Dump) {
 		if x != ObjNil {
 			g.Ctxt = x
 		}
+	}
+}
+
+func link2(d *Dump) {
+	// link stack frames to objects
+	for _, f := range d.Frames {
+		f.Edges = d.appendFields(f.Edges, f.Data, f.Fields)
 	}
 
 	// link data roots
@@ -1834,7 +2009,7 @@ func Read(dumpname, execname string) *Dump {
 	link1(d)
 	if execname != "" {
 		typePropagate(d, execname)
-		nameWithDwarf(d, execname)
+		//nameWithDwarf(d, execname)
 	} else {
 		nameFallback(d)
 	}

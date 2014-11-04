@@ -430,6 +430,10 @@ func histoHandler(w http.ResponseWriter, r *http.Request) {
 	// build sorted list of types
 	var s []hentry
 	for id, b := range byType {
+		if b.bytes == 0 {
+			// This can happen for raw types that were superceded by dwarf types
+			continue
+		}
 		ft := d.FTList[id]
 		s = append(s, hentry{typeLink(ft), len(b.objects), b.bytes})
 	}
