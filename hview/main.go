@@ -1149,11 +1149,11 @@ func readPtr(b []byte) uint64 {
 func printbytes(b []byte) {
 	for i := 0; i < len(b); i++ {
 		fmt.Printf("%02x ", b[i])
-		if i % 16 == 15 {
+		if i%16 == 15 {
 			fmt.Println()
 		}
 	}
-	if len(b) % 16 != 0 {
+	if len(b)%16 != 0 {
 		fmt.Println()
 	}
 }

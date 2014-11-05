@@ -493,8 +493,8 @@ func (r *myReader) Count() int64 {
 }
 
 type tkey struct {
-	size    uint64
-	gcsig   string
+	size  uint64
+	gcsig string
 }
 
 func (d *Dump) makeFullType(size uint64, gcmap string) *FullType {
@@ -560,19 +560,19 @@ func rawRead(filename string) *Dump {
 						sig = append(sig, 'S')
 					}
 					sig = append(sig, 'I', 'I')
-					offset += 2*d.PtrSize
+					offset += 2 * d.PtrSize
 				case FieldKindEface:
 					for off := readUint64(r); offset < off; offset += d.PtrSize {
 						sig = append(sig, 'S')
 					}
 					sig = append(sig, 'E', 'E')
-					offset += 2*d.PtrSize
+					offset += 2 * d.PtrSize
 				case FieldKindEol:
 					break gcloop
 				}
 			}
 			gcsig := string(sig)
-			k := tkey{size,gcsig}
+			k := tkey{size, gcsig}
 			ft := ftmap[k]
 			if ft == nil {
 				ft = d.makeFullType(size, gcsig)
@@ -833,9 +833,9 @@ type dwarfType interface {
 	dwarfFields() []dwarfTypeMember
 }
 type dwarfTypeImpl struct {
-	name   string
-	size   uint64
-	fields []Field
+	name    string
+	size    uint64
+	fields  []Field
 	dFields []dwarfTypeMember
 }
 type dwarfBaseType struct {
@@ -920,7 +920,7 @@ func (t *dwarfBaseType) dwarfFields() []dwarfTypeMember {
 	if t.dFields != nil {
 		return t.dFields
 	}
-	t.dFields = append(t.dFields, dwarfTypeMember{0,"",t}) // TODO: infinite recursion?
+	t.dFields = append(t.dFields, dwarfTypeMember{0, "", t}) // TODO: infinite recursion?
 	return t.dFields
 }
 
@@ -958,7 +958,7 @@ func (t *dwarfPtrType) dwarfFields() []dwarfTypeMember {
 // TODO: how do we deduce types of closure parameters???  We could look at the code
 // pointer and figure it out somehow.
 // TODO: parameterize size by d.PtrSize.
-var dwarfCodePtr dwarfType = &dwarfBaseType{dwarfTypeImpl{"<codeptr>",8,nil,nil}, dw_ate_unsigned}
+var dwarfCodePtr dwarfType = &dwarfBaseType{dwarfTypeImpl{"<codeptr>", 8, nil, nil}, dw_ate_unsigned}
 var dwarfFunc dwarfType = &dwarfPtrType{dwarfTypeImpl{"*<closure>", 8, nil, nil}, dwarfCodePtr}
 
 func (t *dwarfFuncType) Fields() []Field {
@@ -983,7 +983,7 @@ func (t *dwarfStructType) Fields() []Field {
 	// Don't look inside strings, interfaces, slices.
 	switch {
 	case t.name == "string":
-		
+
 		t.fields = append(t.fields, Field{FieldKindPtr, 0, "", ""}, Field{FieldKindUInt64, 0, "", ""}) // TODO: uint32 for 32-bit?
 	case t.name == "runtime.iface":
 		t.fields = append(t.fields, Field{FieldKindPtr, 0, "", unkBase}, Field{FieldKindPtr, 0, "", unkBase})
@@ -991,23 +991,23 @@ func (t *dwarfStructType) Fields() []Field {
 		t.fields = append(t.fields, Field{FieldKindEface, 0, "", ""}, Field{FieldKindEface, 0, "", ""})
 	default:
 		/*
-		// Detect slices.  TODO: This could be fooled by the right user
-		// code, so find a better way.
-		if len(t.members) == 3 &&
-			t.members[0].name == "array" &&
-			t.members[1].name == "len" &&
-			t.members[2].name == "cap" &&
-			t.members[0].offset == 0 &&
-			t.members[1].offset == t.members[0].type_.Size() &&
-			t.members[2].offset == 2*t.members[0].type_.Size() {
-			_, aok := t.members[0].type_.(*dwarfPtrType)
-			l, lok := t.members[1].type_.(*dwarfBaseType)
-			c, cok := t.members[2].type_.(*dwarfBaseType)
-			if aok && lok && cok && l.encoding == dw_ate_unsigned && c.encoding == dw_ate_unsigned {
-				t.fields = append(t.fields, Field{FieldKindSlice, 0, "", t.members[0].type_.Name()[1:]})
-				break
+			// Detect slices.  TODO: This could be fooled by the right user
+			// code, so find a better way.
+			if len(t.members) == 3 &&
+				t.members[0].name == "array" &&
+				t.members[1].name == "len" &&
+				t.members[2].name == "cap" &&
+				t.members[0].offset == 0 &&
+				t.members[1].offset == t.members[0].type_.Size() &&
+				t.members[2].offset == 2*t.members[0].type_.Size() {
+				_, aok := t.members[0].type_.(*dwarfPtrType)
+				l, lok := t.members[1].type_.(*dwarfBaseType)
+				c, cok := t.members[2].type_.(*dwarfBaseType)
+				if aok && lok && cok && l.encoding == dw_ate_unsigned && c.encoding == dw_ate_unsigned {
+					t.fields = append(t.fields, Field{FieldKindSlice, 0, "", t.members[0].type_.Name()[1:]})
+					break
+				}
 			}
-		}
 		*/
 
 		for _, m := range t.members {
@@ -1121,7 +1121,7 @@ func fixName(s string) string {
 				break
 			}
 			var i []interface{}
-			for j := 2; j < len(k); j+=2 {
+			for j := 2; j < len(k); j += 2 {
 				i = append(i, s[k[j]:k[j+1]])
 			}
 			s = s[:k[0]] + fmt.Sprintf(a.formatter, i...) + s[k[1]:]
@@ -1161,14 +1161,14 @@ func dwarfTypeMap(d *Dump, w *dwarf.Data) map[dwarf.Offset]dwarfType {
 			if name == "runtime.iface" {
 				x := new(dwarfIfaceType)
 				x.name = name
-				x.size = 2*d.PtrSize
+				x.size = 2 * d.PtrSize
 				t[e.Offset] = x
 				continue
 			}
 			if name == "runtime.eface" {
 				x := new(dwarfEfaceType)
 				x.name = name
-				x.size = 2*d.PtrSize
+				x.size = 2 * d.PtrSize
 				t[e.Offset] = x
 				continue
 			}
@@ -1260,22 +1260,24 @@ func dwarfTypeMap(d *Dump, w *dwarf.Data) map[dwarf.Offset]dwarfType {
 			currentStruct.members = append(currentStruct.members, dwarfTypeMember{offset, name, type_})
 		}
 	}
-	
+
 	// TODO: remove
 	if false {
-	for _, typ := range t {
-		fmt.Println(typ.Name())
-		n := 0
-		for _, f := range typ.dwarfFields() {
-			if f.type_ != nil {
-				fmt.Printf("  %d %s %s\n", f.offset, f.name, f.type_.Name())
-			} else {
-				fmt.Printf("  %d %s ==NIL==\n", f.offset, f.name)
+		for _, typ := range t {
+			fmt.Println(typ.Name())
+			n := 0
+			for _, f := range typ.dwarfFields() {
+				if f.type_ != nil {
+					fmt.Printf("  %d %s %s\n", f.offset, f.name, f.type_.Name())
+				} else {
+					fmt.Printf("  %d %s ==NIL==\n", f.offset, f.name)
+				}
+				n++
+				if n > 100 {
+					break
+				}
 			}
-			n++
-			if n > 100 { break }
 		}
-	}
 	}
 	return t
 }
@@ -1671,7 +1673,7 @@ func typePropagate(d *Dump, execname string) {
 			log.Printf("can't find itab %x %x", itab, taddr)
 		}
 	}
-	
+
 	// map from heap address to type at that address
 	pc.htypes = map[uint64]dwarfType{}
 
@@ -1680,10 +1682,10 @@ func typePropagate(d *Dump, execname string) {
 	for _, r := range globalRoots(d, w, t) {
 		var data []byte
 		switch {
-		case r.offset>=d.Data.Addr && r.offset < d.Data.Addr+uint64(len(d.Data.Data)):
-			data = d.Data.Data[r.offset - d.Data.Addr:]
-		case r.offset>=d.Bss.Addr && r.offset < d.Bss.Addr+uint64(len(d.Bss.Data)):
-			data = d.Bss.Data[r.offset - d.Bss.Addr:]
+		case r.offset >= d.Data.Addr && r.offset < d.Data.Addr+uint64(len(d.Data.Data)):
+			data = d.Data.Data[r.offset-d.Data.Addr:]
+		case r.offset >= d.Bss.Addr && r.offset < d.Bss.Addr+uint64(len(d.Bss.Data)):
+			data = d.Bss.Data[r.offset-d.Bss.Addr:]
 		default:
 			// this happens for globals in, e.g., noptrbss
 			//log.Printf("global address %s %x not in data [%x %x] or bss [%x %x]", r.name, r.offset, d.Data.Addr, d.Data.Addr+uint64(len(d.Data.Data)), d.Bss.Addr, d.Bss.Addr+uint64(len(d.Bss.Data)))
@@ -1737,14 +1739,14 @@ func typePropagate(d *Dump, execname string) {
 			c = r
 		}
 	}
-	
+
 	// propagate types
 	log.Println("propagating")
 	for len(pc.addrq) > 0 {
 		addr := pc.addrq[len(pc.addrq)-1]
 		pc.addrq = pc.addrq[:len(pc.addrq)-1]
 		typ := pc.htypes[addr]
-		
+
 		obj := d.FindObj(addr)
 		if obj == ObjNil {
 			// Can happen for pointers into stacks (from defers, say)
@@ -1781,7 +1783,7 @@ func typePropagate(d *Dump, execname string) {
 func scanType(pc *propagateContext, data []byte, typ dwarfType) {
 	d := pc.d
 	for _, f := range typ.dwarfFields() {
-		if f.offset + f.type_.Size() > uint64(len(data)) {
+		if f.offset+f.type_.Size() > uint64(len(data)) {
 			log.Fatalf("field past end of object %s %#v", typ.Name(), f)
 		}
 		switch t := f.type_.(type) {
@@ -1841,7 +1843,7 @@ func setType(pc *propagateContext, addr uint64, typ dwarfType) {
 		log.Printf("heap ptr %x doesn't point to an object", addr)
 		return
 	}
-	if addr + typ.Size() > d.Addr(obj) + d.Size(obj) {
+	if addr+typ.Size() > d.Addr(obj)+d.Size(obj) {
 		log.Fatalf("dwarf type larger than object addr=%x typ=%s typsize=%x objaddr=%x objsize=%x", addr, typ.Name(), typ.Size(), d.Addr(obj), d.Size(obj))
 	}
 	if oldtyp, ok := pc.htypes[addr]; ok {
@@ -1853,7 +1855,7 @@ func setType(pc *propagateContext, addr uint64, typ dwarfType) {
 		log.Printf("type mismatch in heap %x %s %s", addr, oldtyp.Name(), typ.Name())
 
 		// TODO: different types are allowed, if one is a prefix of the other.  Check that.
-		
+
 		// Use the bigger type.
 		if oldtyp.Size() >= typ.Size() {
 			return
@@ -2133,22 +2135,22 @@ func nameRaw(d *Dump, ft *FullType) {
 		case 'S':
 			// TODO: byte arrays instead?
 			if d.PtrSize == 8 {
-				ft.Fields = append(ft.Fields, Field{FieldKindBytes8, uint64(i)*d.PtrSize, fmt.Sprintf("%d", i), ""})
+				ft.Fields = append(ft.Fields, Field{FieldKindBytes8, uint64(i) * d.PtrSize, fmt.Sprintf("%d", i), ""})
 			} else {
-				ft.Fields = append(ft.Fields, Field{FieldKindBytes4, uint64(i)*d.PtrSize, fmt.Sprintf("%d", i), ""})
+				ft.Fields = append(ft.Fields, Field{FieldKindBytes4, uint64(i) * d.PtrSize, fmt.Sprintf("%d", i), ""})
 			}
 		case 'P':
-			ft.Fields = append(ft.Fields, Field{FieldKindPtr, uint64(i)*d.PtrSize, fmt.Sprintf("%d", i), ""})
+			ft.Fields = append(ft.Fields, Field{FieldKindPtr, uint64(i) * d.PtrSize, fmt.Sprintf("%d", i), ""})
 		case 'I':
-			ft.Fields = append(ft.Fields, Field{FieldKindIface, uint64(i)*d.PtrSize, fmt.Sprintf("%d", i), ""})
+			ft.Fields = append(ft.Fields, Field{FieldKindIface, uint64(i) * d.PtrSize, fmt.Sprintf("%d", i), ""})
 			i++
 		case 'E':
-			ft.Fields = append(ft.Fields, Field{FieldKindEface, uint64(i)*d.PtrSize, fmt.Sprintf("%d", i), ""})
+			ft.Fields = append(ft.Fields, Field{FieldKindEface, uint64(i) * d.PtrSize, fmt.Sprintf("%d", i), ""})
 			i++
 		}
 	}
 	// after gc signature, there may be more data bytes
-	for i := uint64(len(ft.GCSig))*d.PtrSize; i < ft.Size; i += d.PtrSize {
+	for i := uint64(len(ft.GCSig)) * d.PtrSize; i < ft.Size; i += d.PtrSize {
 		if d.PtrSize == 8 {
 			ft.Fields = append(ft.Fields, Field{FieldKindBytes8, i, fmt.Sprintf("%d", i/d.PtrSize), ""})
 		} else {
