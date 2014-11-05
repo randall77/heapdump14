@@ -869,11 +869,9 @@ type dwarfFuncType struct {
 }
 type dwarfIfaceType struct {
 	dwarfTypeImpl
-	members []dwarfTypeMember // dummy, filled in but not used
 }
 type dwarfEfaceType struct {
 	dwarfTypeImpl
-	members []dwarfTypeMember
 }
 
 func (t *dwarfTypeImpl) Name() string {
@@ -1102,7 +1100,7 @@ func (t *dwarfEfaceType) dwarfFields() []dwarfTypeMember {
 // Some type names in the dwarf info don't match the corresponding
 // type names in the binary.  We'll use the rewrites here to map
 // between the two.
-// TODO: just map names for now.  Rename this?  Do this conversion in the dwarf dumper?
+// TODO: just map names for now.  Do this conversion in the dwarf dumper?
 type adjTypeName struct {
 	matcher   *regexp.Regexp
 	formatter string
@@ -1111,6 +1109,7 @@ type adjTypeName struct {
 var adjTypeNames = []adjTypeName{
 	{regexp.MustCompile(`hash<(.*),(.*)>`), "map.hdr[%s]%s"},
 	{regexp.MustCompile(`bucket<(.*),(.*)>`), "map.bucket[%s]%s"},
+	// TODO: hchan<>?
 }
 
 // fix up dwarf names to match internal names
@@ -1624,8 +1623,9 @@ func typePropagate(d *Dump, execname string) {
 		name2dwarf[typ.Name()] = typ
 	}
 
-	// some runtime type names have just package names instead of package paths, e.g.
-	// gob.CommonType instead of encoding/gob.CommonType.
+	// Some runtime type names have just package names instead of package paths, e.g.
+	// gob.CommonType instead of encoding/gob.CommonType.  Figure out how the short
+	// runtime names map to the long dwarf names.
 	// TODO: matching types by name is very error prone.  There's got to be a better way.
 	// For now, if there is a unique mapping from runtime type to dwarf type, use it.
 	short2long := map[string][]dwarfType{}
@@ -1634,15 +1634,14 @@ func typePropagate(d *Dump, execname string) {
 		short2long[n] = append(short2long[n], dt)
 	}
 	for n, a := range short2long {
-		if len(a) > 1 {
-			log.Printf("ambiguous type %s", n)
-			for _, dt := range a {
-				log.Printf("  %s", dt.Name())
-			}
-		}
 		if len(a) == 1 {
 			// the short name matches a unique long name.
 			name2dwarf[n] = a[0]
+			continue
+		}
+		log.Printf("ambiguous type %s", n)
+		for _, dt := range a {
+			log.Printf("  %s", dt.Name())
 		}
 	}
 
@@ -1651,6 +1650,7 @@ func typePropagate(d *Dump, execname string) {
 	for _, typ := range d.TypeMap {
 		dt := name2dwarf[typ.Name]
 		if dt == nil {
+			log.Printf("can't find type %s", typ.Name)
 			continue
 		}
 		if typ.efaceptr {
@@ -1665,18 +1665,11 @@ func typePropagate(d *Dump, execname string) {
 	// map from itab entry to dwarf type (for resolving ifaces)
 	pc.itab2dwarf = map[uint64]dwarfType{}
 	for itab, taddr := range d.ItabMap {
-		typ := d.TypeMap[taddr]
-		if typ == nil {
-			log.Fatalf("can't find type taddr=%x", taddr)
-		}
-		dt := name2dwarf[typ.Name]
-		if dt == nil {
-			continue
-		}
-		if typ.efaceptr {
-			dt = dt.dwarfFields()[0].type_.(*dwarfPtrType).elem
-		}
+		dt, ok := pc.type2dwarf[taddr]
 		pc.itab2dwarf[itab] = dt
+		if !ok {
+			log.Printf("can't find itab %x %x", itab, taddr)
+		}
 	}
 	
 	// map from heap address to type at that address
@@ -1701,7 +1694,7 @@ func typePropagate(d *Dump, execname string) {
 
 	// set types of objects which are pointed to by stacks
 	layouts := frameLayouts(d, w, t)
-	log.Printf("locals & args")
+	log.Printf("stacks")
 	live := map[uint64]bool{}
 	for _, g := range d.Goroutines {
 		var c *StackFrame
@@ -1712,13 +1705,9 @@ func typePropagate(d *Dump, execname string) {
 			}
 			for _, f := range r.Fields {
 				switch f.Kind {
-				case FieldKindPtr:
-					//log.Printf("liveptr %x\n", f.Offset)
+				case FieldKindPtr, FieldKindIface, FieldKindEface:
+					//log.Printf("live %x\n", f.Offset)
 					live[f.Offset] = true
-				case FieldKindIface, FieldKindEface:
-					//log.Printf("liveiface %x %x\n", f.Offset, f.Offset+d.PtrSize)
-					live[f.Offset] = true
-					live[f.Offset+d.PtrSize] = true
 				}
 			}
 
@@ -1738,7 +1727,8 @@ func typePropagate(d *Dump, execname string) {
 				scanType(&pc, r.Data[i:], local.type_)
 			}
 			if c != nil {
-				// find live pointers in outargs section
+				// find pointers in outargs section
+				// arg section is always live
 				for _, arg := range layouts[c.Name].args {
 					//log.Printf("  arg %s @ %x", arg.name, arg.offset)
 					scanType(&pc, r.Data[arg.offset:], arg.type_)
@@ -1758,7 +1748,7 @@ func typePropagate(d *Dump, execname string) {
 		obj := d.FindObj(addr)
 		if obj == ObjNil {
 			// Can happen for pointers into stacks (from defers, say)
-			//log.Fatalf("pointer %x is not to valid heap object addr=%s", addr, typ.Name())
+			//log.Printf("pointer %x is not to valid heap object addr=%s", addr, typ.Name())
 			continue
 		}
 		base := d.Addr(obj)
@@ -1792,7 +1782,7 @@ func scanType(pc *propagateContext, data []byte, typ dwarfType) {
 	d := pc.d
 	for _, f := range typ.dwarfFields() {
 		if f.offset + f.type_.Size() > uint64(len(data)) {
-			log.Fatalf("field past end of object %s %#v %d", typ.Name(), f)
+			log.Fatalf("field past end of object %s %#v", typ.Name(), f)
 		}
 		switch t := f.type_.(type) {
 		case *dwarfPtrType:
@@ -1813,13 +1803,11 @@ func scanType(pc *propagateContext, data []byte, typ dwarfType) {
 				log.Printf("  itab=%x", itab)
 				log.Printf("  taddr=%x", d.ItabMap[itab])
 				log.Printf("  typ=%s", d.TypeMap[d.ItabMap[itab]].Name)
-				//log.Fatalf("itab entry has no dwarf type")
 				continue
 			}
 			p := readPtr(d, data[f.offset+d.PtrSize:])
 			setType(pc, p, it)
 		case *dwarfEfaceType:
-			/*
 			addr := readPtr(d, data[f.offset:])
 			if addr == 0 {
 				continue
@@ -1833,7 +1821,6 @@ func scanType(pc *propagateContext, data []byte, typ dwarfType) {
 			}
 			p := readPtr(d, data[f.offset+d.PtrSize:])
 			setType(pc, p, it)
-*/
 		case *dwarfBaseType:
 			// nothing to do
 		default:
@@ -1867,7 +1854,7 @@ func setType(pc *propagateContext, addr uint64, typ dwarfType) {
 
 		// TODO: different types are allowed, if one is a prefix of the other.  Check that.
 		
-		// Use bigger type.
+		// Use the bigger type.
 		if oldtyp.Size() >= typ.Size() {
 			return
 		}
@@ -2091,10 +2078,6 @@ func link2(d *Dump) {
 	}
 }
 
-func name(d *Dump) {
-	
-}
-
 func nameFallback(d *Dump) {
 	// No dwarf info, just name generically
 	for _, t := range d.Types {
@@ -2184,6 +2167,7 @@ func nameDwarf(d *Dump, ft *FullType) {
 		switch typ := f.type_.(type) {
 		case *dwarfPtrType:
 			if typ.elem == nil {
+				// TODO: viewer should escape <, so we can use that instead of &lt;
 				ft.Fields = append(ft.Fields, Field{FieldKindPtr, f.offset, f.name, "&lt;untyped&gt;"})
 			} else {
 				ft.Fields = append(ft.Fields, Field{FieldKindPtr, f.offset, f.name, typ.elem.Name()})
@@ -2191,36 +2175,40 @@ func nameDwarf(d *Dump, ft *FullType) {
 		case *dwarfBaseType:
 			switch {
 			case typ.encoding == dw_ate_boolean:
-				ft.Fields = append(ft.Fields, Field{FieldKindBool, f.offset, f.name, "bool"})
+				ft.Fields = append(ft.Fields, Field{FieldKindBool, f.offset, f.name, ""})
 			case typ.encoding == dw_ate_signed && typ.size == 1:
-				ft.Fields = append(ft.Fields, Field{FieldKindSInt8, f.offset, f.name, "int8"})
+				ft.Fields = append(ft.Fields, Field{FieldKindSInt8, f.offset, f.name, ""})
 			case typ.encoding == dw_ate_unsigned && typ.size == 1:
-				ft.Fields = append(ft.Fields, Field{FieldKindUInt8, f.offset, f.name, "uint8"})
+				ft.Fields = append(ft.Fields, Field{FieldKindUInt8, f.offset, f.name, ""})
 			case typ.encoding == dw_ate_signed && typ.size == 2:
-				ft.Fields = append(ft.Fields, Field{FieldKindSInt16, f.offset, f.name, "int16"})
+				ft.Fields = append(ft.Fields, Field{FieldKindSInt16, f.offset, f.name, ""})
 			case typ.encoding == dw_ate_unsigned && typ.size == 2:
-				ft.Fields = append(ft.Fields, Field{FieldKindUInt16, f.offset, f.name, "uint16"})
+				ft.Fields = append(ft.Fields, Field{FieldKindUInt16, f.offset, f.name, ""})
 			case typ.encoding == dw_ate_signed && typ.size == 4:
-				ft.Fields = append(ft.Fields, Field{FieldKindSInt32, f.offset, f.name, "int32"})
+				ft.Fields = append(ft.Fields, Field{FieldKindSInt32, f.offset, f.name, ""})
 			case typ.encoding == dw_ate_unsigned && typ.size == 4:
-				ft.Fields = append(ft.Fields, Field{FieldKindUInt32, f.offset, f.name, "uint32"})
+				ft.Fields = append(ft.Fields, Field{FieldKindUInt32, f.offset, f.name, ""})
 			case typ.encoding == dw_ate_signed && typ.size == 8:
-				ft.Fields = append(ft.Fields, Field{FieldKindSInt64, f.offset, f.name, "int64"})
+				ft.Fields = append(ft.Fields, Field{FieldKindSInt64, f.offset, f.name, ""})
 			case typ.encoding == dw_ate_unsigned && typ.size == 8:
-				ft.Fields = append(ft.Fields, Field{FieldKindUInt64, f.offset, f.name, "uint64"})
+				ft.Fields = append(ft.Fields, Field{FieldKindUInt64, f.offset, f.name, ""})
 			case typ.encoding == dw_ate_float && typ.size == 4:
-				ft.Fields = append(ft.Fields, Field{FieldKindFloat32, f.offset, f.name, "float32"})
+				ft.Fields = append(ft.Fields, Field{FieldKindFloat32, f.offset, f.name, ""})
 			case typ.encoding == dw_ate_float && typ.size == 8:
-				ft.Fields = append(ft.Fields, Field{FieldKindFloat64, f.offset, f.name, "float64"})
+				ft.Fields = append(ft.Fields, Field{FieldKindFloat64, f.offset, f.name, ""})
 			case typ.encoding == dw_ate_complex_float && typ.size == 8:
-				ft.Fields = append(ft.Fields, Field{FieldKindComplex64, f.offset, f.name, "complex64"})
+				ft.Fields = append(ft.Fields, Field{FieldKindComplex64, f.offset, f.name, ""})
 			case typ.encoding == dw_ate_complex_float && typ.size == 16:
-				ft.Fields = append(ft.Fields, Field{FieldKindComplex128, f.offset, f.name, "complex128"})
+				ft.Fields = append(ft.Fields, Field{FieldKindComplex128, f.offset, f.name, ""})
 			default:
-				log.Fatalf("unknown encoding type encoding=%d size=%d", typ.encoding, typ.size)
+				log.Fatalf("unknown encoding encoding=%d size=%d", typ.encoding, typ.size)
 			}
+		case *dwarfIfaceType:
+			ft.Fields = append(ft.Fields, Field{FieldKindIface, f.offset, f.name, ""})
+		case *dwarfEfaceType:
+			ft.Fields = append(ft.Fields, Field{FieldKindEface, f.offset, f.name, ""})
 		default:
-			// TODO: iface,....
+			log.Fatalf("bad dwarf type %v", typ)
 		}
 	}
 }
@@ -2236,7 +2224,6 @@ func Read(dumpname, execname string) *Dump {
 	link1(d)
 	if execname != "" {
 		typePropagate(d, execname)
-		name(d)
 		//nameWithDwarf(d, execname)
 	} else {
 		nameFallback(d)
