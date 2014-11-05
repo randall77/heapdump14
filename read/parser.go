@@ -42,9 +42,10 @@ const (
 	FieldKindComplex64            = 17
 	FieldKindComplex128           = 18
 
-	FieldKindBytes8      = 19
-	FieldKindBytes16     = 20
-	FieldKindBytesElided = 21
+	FieldKindBytes4      = 19
+	FieldKindBytes8      = 20
+	FieldKindBytes16     = 21
+	FieldKindBytesElided = 22
 
 	TypeKindObject       TypeKind = 0
 	TypeKindArray                 = 1
@@ -153,6 +154,7 @@ type FullType struct {
 	GCSig  string
 	Name   string
 	Fields []Field
+	Type   dwarfType
 }
 
 // An edge is a directed connection between two objects.  The source
@@ -496,7 +498,7 @@ type tkey struct {
 
 func (d *Dump) makeFullType(size uint64, gcmap string) *FullType {
 	name := fmt.Sprintf("%d_%s", size, gcmap)
-	ft := &FullType{len(d.FTList), size, gcmap, name, nil}
+	ft := &FullType{len(d.FTList), size, gcmap, name, nil, nil}
 	d.FTList = append(d.FTList, ft)
 	return ft
 }
@@ -1594,6 +1596,7 @@ type propagateContext struct {
 }
 
 func typePropagate(d *Dump, execname string) {
+	// TODO: special case the unsafe.Pointer in reflect.value
 	w := getDwarf(execname)
 	t := dwarfTypeMap(d, w)
 
@@ -1737,7 +1740,7 @@ func typePropagate(d *Dump, execname string) {
 		if t, ok := pc.htypes[addr]; ok {
 			ft, ok := dwarfToFull[t]
 			if !ok {
-				ft = &FullType{len(d.FTList), t.Size(), "", t.Name(), nil}
+				ft = &FullType{len(d.FTList), t.Size(), "", t.Name(), nil, t}
 				d.FTList = append(d.FTList, ft)
 				dwarfToFull[t] = ft
 			}
@@ -2050,6 +2053,10 @@ func link2(d *Dump) {
 	}
 }
 
+func name(d *Dump) {
+	
+}
+
 func nameFallback(d *Dump) {
 	// No dwarf info, just name generically
 	for _, t := range d.Types {
@@ -2091,38 +2098,91 @@ var chanFields = map[uint64]map[uint64]string{
 
 func nameFullTypes(d *Dump) {
 	for _, ft := range d.FTList {
-		for i := 0; i < len(ft.GCSig); i++ {
-			switch ft.GCSig[i] {
-			case 'S':
-				// TODO: byte arrays instead?
-				if d.PtrSize == 8 {
-					ft.Fields = append(ft.Fields, Field{FieldKindUInt64, uint64(i)*d.PtrSize, fmt.Sprintf("f%d", i), ""})
-				} else {
-					ft.Fields = append(ft.Fields, Field{FieldKindUInt32, uint64(i)*d.PtrSize, fmt.Sprintf("f%d", i), ""})
-				}
-			case 'P':
-				ft.Fields = append(ft.Fields, Field{FieldKindPtr, uint64(i)*d.PtrSize, fmt.Sprintf("f%d", i), ""})
-			case 'I':
-				ft.Fields = append(ft.Fields, Field{FieldKindIface, uint64(i)*d.PtrSize, fmt.Sprintf("f%d", i), ""})
-				i++
-			case 'E':
-				ft.Fields = append(ft.Fields, Field{FieldKindEface, uint64(i)*d.PtrSize, fmt.Sprintf("f%d", i), ""})
-				i++
-			}
+		if ft.Type == nil {
+			nameRaw(d, ft)
+		} else {
+			nameDwarf(d, ft)
 		}
-		// after gc signature, there may be more data bytes
-		for i := uint64(len(ft.GCSig))*d.PtrSize; i < ft.Size; i += d.PtrSize {
+	}
+}
+
+func nameRaw(d *Dump, ft *FullType) {
+	for i := 0; i < len(ft.GCSig); i++ {
+		switch ft.GCSig[i] {
+		case 'S':
 			// TODO: byte arrays instead?
 			if d.PtrSize == 8 {
-				ft.Fields = append(ft.Fields, Field{FieldKindUInt64, i, fmt.Sprintf("%d", i/d.PtrSize), ""})
+				ft.Fields = append(ft.Fields, Field{FieldKindBytes8, uint64(i)*d.PtrSize, fmt.Sprintf("%d", i), ""})
 			} else {
-				ft.Fields = append(ft.Fields, Field{FieldKindUInt32, i, fmt.Sprintf("%d", i/d.PtrSize), ""})
+				ft.Fields = append(ft.Fields, Field{FieldKindBytes4, uint64(i)*d.PtrSize, fmt.Sprintf("%d", i), ""})
 			}
-			if i >= 1<<16 {
-				// ignore >64KB of data
-				ft.Fields = append(ft.Fields, Field{FieldKindBytesElided, i, fmt.Sprintf("offset %x", i), ""})
-				break
+		case 'P':
+			ft.Fields = append(ft.Fields, Field{FieldKindPtr, uint64(i)*d.PtrSize, fmt.Sprintf("%d", i), ""})
+		case 'I':
+			ft.Fields = append(ft.Fields, Field{FieldKindIface, uint64(i)*d.PtrSize, fmt.Sprintf("%d", i), ""})
+			i++
+		case 'E':
+			ft.Fields = append(ft.Fields, Field{FieldKindEface, uint64(i)*d.PtrSize, fmt.Sprintf("%d", i), ""})
+			i++
+		}
+	}
+	// after gc signature, there may be more data bytes
+	for i := uint64(len(ft.GCSig))*d.PtrSize; i < ft.Size; i += d.PtrSize {
+		if d.PtrSize == 8 {
+			ft.Fields = append(ft.Fields, Field{FieldKindBytes8, i, fmt.Sprintf("%d", i/d.PtrSize), ""})
+		} else {
+			ft.Fields = append(ft.Fields, Field{FieldKindBytes4, i, fmt.Sprintf("%d", i/d.PtrSize), ""})
+		}
+		if i >= 1<<16 {
+			// ignore >64KB of data
+			ft.Fields = append(ft.Fields, Field{FieldKindBytesElided, i, fmt.Sprintf("%d", i/d.PtrSize), ""})
+			break
+		}
+	}
+}
+func nameDwarf(d *Dump, ft *FullType) {
+	t := ft.Type
+	for _, f := range t.dwarfFields() {
+		switch typ := f.type_.(type) {
+		case *dwarfPtrType:
+			if typ.elem == nil {
+				ft.Fields = append(ft.Fields, Field{FieldKindPtr, f.offset, f.name, "&lt;untyped&gt;"})
+			} else {
+				ft.Fields = append(ft.Fields, Field{FieldKindPtr, f.offset, f.name, typ.elem.Name()})
 			}
+		case *dwarfBaseType:
+			switch {
+			case typ.encoding == dw_ate_boolean:
+				ft.Fields = append(ft.Fields, Field{FieldKindBool, f.offset, f.name, "bool"})
+			case typ.encoding == dw_ate_signed && typ.size == 1:
+				ft.Fields = append(ft.Fields, Field{FieldKindSInt8, f.offset, f.name, "int8"})
+			case typ.encoding == dw_ate_unsigned && typ.size == 1:
+				ft.Fields = append(ft.Fields, Field{FieldKindUInt8, f.offset, f.name, "uint8"})
+			case typ.encoding == dw_ate_signed && typ.size == 2:
+				ft.Fields = append(ft.Fields, Field{FieldKindSInt16, f.offset, f.name, "int16"})
+			case typ.encoding == dw_ate_unsigned && typ.size == 2:
+				ft.Fields = append(ft.Fields, Field{FieldKindUInt16, f.offset, f.name, "uint16"})
+			case typ.encoding == dw_ate_signed && typ.size == 4:
+				ft.Fields = append(ft.Fields, Field{FieldKindSInt32, f.offset, f.name, "int32"})
+			case typ.encoding == dw_ate_unsigned && typ.size == 4:
+				ft.Fields = append(ft.Fields, Field{FieldKindUInt32, f.offset, f.name, "uint32"})
+			case typ.encoding == dw_ate_signed && typ.size == 8:
+				ft.Fields = append(ft.Fields, Field{FieldKindSInt64, f.offset, f.name, "int64"})
+			case typ.encoding == dw_ate_unsigned && typ.size == 8:
+				ft.Fields = append(ft.Fields, Field{FieldKindUInt64, f.offset, f.name, "uint64"})
+			case typ.encoding == dw_ate_float && typ.size == 4:
+				ft.Fields = append(ft.Fields, Field{FieldKindFloat32, f.offset, f.name, "float32"})
+			case typ.encoding == dw_ate_float && typ.size == 8:
+				ft.Fields = append(ft.Fields, Field{FieldKindFloat64, f.offset, f.name, "float64"})
+			case typ.encoding == dw_ate_complex_float && typ.size == 8:
+				ft.Fields = append(ft.Fields, Field{FieldKindComplex64, f.offset, f.name, "complex64"})
+			case typ.encoding == dw_ate_complex_float && typ.size == 16:
+				ft.Fields = append(ft.Fields, Field{FieldKindComplex128, f.offset, f.name, "complex128"})
+			default:
+				log.Fatalf("unknown encoding type encoding=%d size=%d", typ.encoding, typ.size)
+			}
+		default:
+			// TODO: iface,....
 		}
 	}
 }
@@ -2138,6 +2198,7 @@ func Read(dumpname, execname string) *Dump {
 	link1(d)
 	if execname != "" {
 		typePropagate(d, execname)
+		name(d)
 		//nameWithDwarf(d, execname)
 	} else {
 		nameFallback(d)

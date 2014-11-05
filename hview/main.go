@@ -146,6 +146,10 @@ func getFields(b []byte, fields []read.Field, edges []read.Edge) []Field {
 			value = fmt.Sprintf("%d", int64(d.Order.Uint64(b[off:])))
 			typ = "int64"
 			off += 8
+		case read.FieldKindBytes4:
+			value = rawBytes(b[off : off+4])
+			typ = "raw bytes"
+			off += 4
 		case read.FieldKindBytes8:
 			value = rawBytes(b[off : off+8])
 			typ = "raw bytes"
