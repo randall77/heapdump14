@@ -141,7 +141,7 @@ type Dump struct {
 type Type struct {
 	Name     string // not necessarily unique
 	Size     uint64
-	efaceptr bool    // Efaces with this type have a data field which is a pointer
+	efaceptr bool    // interfaces with this type store the (pointer-like) value directly
 	Fields   []Field // ordered in increasing offset order
 
 	Addr uint64
@@ -846,6 +846,7 @@ type dwarfTypedef struct {
 type dwarfStructType struct {
 	dwarfTypeImpl
 	members []dwarfTypeMember
+	isSlice bool
 }
 type dwarfTypeMember struct {
 	offset uint64
@@ -862,6 +863,14 @@ type dwarfArrayType struct {
 }
 type dwarfFuncType struct {
 	dwarfTypeImpl
+}
+type dwarfIfaceType struct {
+	dwarfTypeImpl
+	members []dwarfTypeMember // dummy, filled in but not used
+}
+type dwarfEfaceType struct {
+	dwarfTypeImpl
+	members []dwarfTypeMember
 }
 
 func (t *dwarfTypeImpl) Name() string {
@@ -1059,6 +1068,34 @@ func (t *dwarfArrayType) dwarfFields() []dwarfTypeMember {
 	return t.dFields
 }
 
+func (t *dwarfIfaceType) Fields() []Field {
+	if t.fields == nil {
+		t.fields = append(t.fields, Field{FieldKindIface, 0, "", ""})
+	}
+	return t.fields
+}
+
+func (t *dwarfIfaceType) dwarfFields() []dwarfTypeMember {
+	if t.dFields == nil {
+		t.dFields = append(t.dFields, dwarfTypeMember{0, "", t})
+	}
+	return t.dFields
+}
+
+func (t *dwarfEfaceType) Fields() []Field {
+	if t.fields == nil {
+		t.fields = append(t.fields, Field{FieldKindEface, 0, "", ""})
+	}
+	return t.fields
+}
+
+func (t *dwarfEfaceType) dwarfFields() []dwarfTypeMember {
+	if t.dFields == nil {
+		t.dFields = append(t.dFields, dwarfTypeMember{0, "", t})
+	}
+	return t.dFields
+}
+
 // Some type names in the dwarf info don't match the corresponding
 // type names in the binary.  We'll use the rewrites here to map
 // between the two.
@@ -1071,6 +1108,24 @@ type adjTypeName struct {
 var adjTypeNames = []adjTypeName{
 	{regexp.MustCompile(`hash<(.*),(.*)>`), "map.hdr[%s]%s"},
 	{regexp.MustCompile(`bucket<(.*),(.*)>`), "map.bucket[%s]%s"},
+}
+
+// fix up dwarf names to match internal names
+func fixName(s string) string {
+	for _, a := range adjTypeNames {
+		for {
+			k := a.matcher.FindStringSubmatchIndex(s)
+			if k == nil {
+				break
+			}
+			var i []interface{}
+			for j := 2; j < len(k); j+=2 {
+				i = append(i, s[k[j]:k[j+1]])
+			}
+			s = s[:k[0]] + fmt.Sprintf(a.formatter, i...) + s[k[1]:]
+		}
+	}
+	return s
 }
 
 // load a map of all of the dwarf types
@@ -1090,41 +1145,51 @@ func dwarfTypeMap(d *Dump, w *dwarf.Data) map[dwarf.Offset]dwarfType {
 		switch e.Tag {
 		case dwarf.TagBaseType:
 			x := new(dwarfBaseType)
-			x.name = e.Val(dwarf.AttrName).(string)
+			x.name = fixName(e.Val(dwarf.AttrName).(string))
 			x.size = uint64(e.Val(dwarf.AttrByteSize).(int64))
 			x.encoding = e.Val(dwarf.AttrEncoding).(int64)
 			t[e.Offset] = x
 		case dwarf.TagPointerType:
 			x := new(dwarfPtrType)
-			x.name = e.Val(dwarf.AttrName).(string)
+			x.name = fixName(e.Val(dwarf.AttrName).(string))
 			x.size = d.PtrSize
 			t[e.Offset] = x
 		case dwarf.TagStructType:
+			name := fixName(e.Val(dwarf.AttrName).(string))
+			if name == "runtime.iface" {
+				x := new(dwarfIfaceType)
+				x.name = name
+				x.size = 2*d.PtrSize
+				t[e.Offset] = x
+				continue
+			}
+			if name == "runtime.eface" {
+				x := new(dwarfEfaceType)
+				x.name = name
+				x.size = 2*d.PtrSize
+				t[e.Offset] = x
+				continue
+			}
 			x := new(dwarfStructType)
-			x.name = e.Val(dwarf.AttrName).(string)
+			x.name = name
 			x.size = uint64(e.Val(dwarf.AttrByteSize).(int64))
-			for _, a := range adjTypeNames {
-				if k := a.matcher.FindStringSubmatch(x.name); k != nil {
-					var i []interface{}
-					for _, j := range k[1:] {
-						i = append(i, j)
-					}
-					x.name = fmt.Sprintf(a.formatter, i...)
-				}
+			if len(x.name) >= 2 && x.name[:2] == "[]" {
+				// TODO: check array/len/cap
+				x.isSlice = true
 			}
 			t[e.Offset] = x
 		case dwarf.TagArrayType:
 			x := new(dwarfArrayType)
-			x.name = e.Val(dwarf.AttrName).(string)
+			x.name = fixName(e.Val(dwarf.AttrName).(string))
 			x.size = uint64(e.Val(dwarf.AttrByteSize).(int64))
 			t[e.Offset] = x
 		case dwarf.TagTypedef:
 			x := new(dwarfTypedef)
-			x.name = e.Val(dwarf.AttrName).(string)
+			x.name = fixName(e.Val(dwarf.AttrName).(string))
 			t[e.Offset] = x
 		case dwarf.TagSubroutineType:
 			x := new(dwarfFuncType)
-			x.name = e.Val(dwarf.AttrName).(string)
+			x.name = fixName(e.Val(dwarf.AttrName).(string))
 			x.size = d.PtrSize
 			t[e.Offset] = x
 		}
@@ -1161,8 +1226,19 @@ func dwarfTypeMap(d *Dump, w *dwarf.Data) map[dwarf.Offset]dwarfType {
 		case dwarf.TagArrayType:
 			t[e.Offset].(*dwarfArrayType).elem = t[e.Val(dwarf.AttrType).(dwarf.Offset)]
 		case dwarf.TagStructType:
-			currentStruct = t[e.Offset].(*dwarfStructType)
+			name := e.Val(dwarf.AttrName).(string)
+			switch name {
+			case "runtime.iface":
+				currentStruct = nil
+			case "runtime.eface":
+				currentStruct = nil
+			default:
+				currentStruct = t[e.Offset].(*dwarfStructType)
+			}
 		case dwarf.TagMember:
+			if currentStruct == nil {
+				continue
+			}
 			name := e.Val(dwarf.AttrName).(string)
 			type_ := t[e.Val(dwarf.AttrType).(dwarf.Offset)]
 			loc := e.Val(dwarf.AttrDataMemberLoc).([]uint8)
@@ -1504,48 +1580,82 @@ func (d *Dump) appendFields(edges []Edge, data []byte, fields []Field) []Edge {
 	return edges
 }
 
+type propagateContext struct {
+	d *Dump
+
+	type2dwarf map[uint64]dwarfType
+	itab2dwarf map[uint64]dwarfType
+
+	// map from heap address to type at that address
+	htypes map[uint64]dwarfType
+
+	// queue of objects yet to be "scanned"
+	addrq []uint64
+}
+
 func typePropagate(d *Dump, execname string) {
 	w := getDwarf(execname)
 	t := dwarfTypeMap(d, w)
 
-	// map from heap address to type at that address
-	htypes := map[uint64]dwarfType{}
+	var pc propagateContext
+	pc.d = d
 
-	// set of addresses from which we still need to propagate
-	var addrq []uint64
+	// map from type name to dwarf type
+	name2dwarf := map[string]dwarfType{}
+	for _, typ := range t {
+		name2dwarf[typ.Name()] = typ
+	}
+
+	// map from type address to dwarf type (for resolving efaces)
+	pc.type2dwarf = map[uint64]dwarfType{}
+	for _, typ := range d.TypeMap {
+		dt := name2dwarf[typ.Name]
+		if dt == nil {
+			continue
+		}
+		if typ.efaceptr {
+			// We want typ to be the pointed-to object's type.
+			// Interfaces store pointers directly, so the target's type
+			// needs a dereference.
+			dt = dt.dwarfFields()[0].type_.(*dwarfPtrType).elem
+		}
+		pc.type2dwarf[typ.Addr] = dt
+	}
+
+	// map from itab entry to dwarf type (for resolving ifaces)
+	pc.itab2dwarf = map[uint64]dwarfType{}
+	for itab, taddr := range d.ItabMap {
+		typ := d.TypeMap[taddr]
+		if typ == nil {
+			log.Fatalf("can't find type taddr=%x", taddr)
+		}
+		dt := name2dwarf[typ.Name]
+		if dt == nil {
+			continue
+		}
+		if typ.efaceptr {
+			dt = dt.dwarfFields()[0].type_.(*dwarfPtrType).elem
+		}
+		pc.itab2dwarf[itab] = dt
+	}
+	
+	// map from heap address to type at that address
+	pc.htypes = map[uint64]dwarfType{}
 
 	// set types of objects which are pointed to by globals
 	for _, r := range globalRoots(d, w, t) {
-		var off uint64
-		var b []byte
+		var data []byte
 		switch {
 		case r.offset>=d.Data.Addr && r.offset < d.Data.Addr+uint64(len(d.Data.Data)):
-			b = d.Data.Data
-			off = r.offset - d.Data.Addr
+			data = d.Data.Data[r.offset - d.Data.Addr:]
 		case r.offset>=d.Bss.Addr && r.offset < d.Bss.Addr+uint64(len(d.Bss.Data)):
-			b = d.Bss.Data
-			off = r.offset - d.Bss.Addr
+			data = d.Bss.Data[r.offset - d.Bss.Addr:]
 		default:
+			// this happens for globals in, e.g., noptrbss
 			//log.Printf("global address %s %x not in data [%x %x] or bss [%x %x]", r.name, r.offset, d.Data.Addr, d.Data.Addr+uint64(len(d.Data.Data)), d.Bss.Addr, d.Bss.Addr+uint64(len(d.Bss.Data)))
 			continue
 		}
-		for _, f := range r.type_.dwarfFields() {
-			// we've squashed typedef, struct, array at this point.
-			switch t := f.type_.(type) {
-			case *dwarfPtrType:
-				p := readPtr(d, b[off + f.offset:])
-				if t.elem != nil {
-					// t.elem is nil for unsafe.Pointer
-					if setType(d, htypes, p, t.elem) {
-						addrq = append(addrq, p)
-					}
-				}
-			case *dwarfBaseType:
-				// nothing to do
-			default:
-				log.Fatalf("unknown type for field %#v", f)
-			}
-		}
+		scanType(&pc, data[:r.type_.Size()], r.type_)
 	}
 
 	// set types of objects which are pointed to by stacks
@@ -1573,55 +1683,24 @@ func typePropagate(d *Dump, execname string) {
 
 			// find live pointers, propagate types along them
 			for _, local := range layouts[r.Name].locals {
-				//log.Printf("  local %s @ %x", local.name, uint64(len(r.Data))-local.offset)
-				for _, f := range local.type_.dwarfFields() {
-					//log.Printf("    field %s @ %x", f.name, uint64(len(r.Data))-local.offset+f.offset)
-					switch t := f.type_.(type) {
-					case *dwarfPtrType:
-						if t.elem == nil {
-							// untyped pointer
-							continue
-						}
-						i := uint64(len(r.Data)) - local.offset + f.offset
-						if !live[i] {
-							continue
-						}
-						p := readPtr(d, r.Data[i:])
-						if setType(d, htypes, p, t.elem) {
-							addrq = append(addrq, p)
-						}
-					case *dwarfBaseType:
-						// nothing to do
-					default:
-						log.Fatalf("unknown type for field %#v", f)
+				i := uint64(len(r.Data)) - local.offset
+				for j := uint64(0); j < local.type_.Size(); j += d.PtrSize {
+					if live[i+j] {
+						goto islive
 					}
 				}
+				// local is dead, don't scan it
+				// TODO: check to make sure all pointers are live or all pointers are
+				// dead, not a mix of the two.
+				continue
+			islive:
+				scanType(&pc, r.Data[i:], local.type_)
 			}
 			if c != nil {
 				// find live pointers in outargs section
 				for _, arg := range layouts[c.Name].args {
 					//log.Printf("  arg %s @ %x", arg.name, arg.offset)
-					for _, f := range arg.type_.dwarfFields() {
-						switch t := f.type_.(type) {
-						case *dwarfPtrType:
-							if t.elem == nil {
-								// untyped pointer
-								continue
-							}
-							i := arg.offset + f.offset
-							if !live[i] {
-								continue
-							}
-							p := readPtr(d, r.Data[i:])
-							if setType(d, htypes, p, t.elem) {
-								addrq = append(addrq, p)
-							}
-						case *dwarfBaseType:
-							// nothing to do
-						default:
-							log.Fatalf("unknown type for field %#v", f)
-						}
-					}
+					scanType(&pc, r.Data[arg.offset:], arg.type_)
 				}
 			}
 			c = r
@@ -1630,37 +1709,24 @@ func typePropagate(d *Dump, execname string) {
 	
 	// propagate types
 	log.Println("propagating")
-	for len(addrq) > 0 {
-		addr := addrq[len(addrq)-1]
-		addrq = addrq[:len(addrq)-1]
-		typ := htypes[addr]
+	for len(pc.addrq) > 0 {
+		addr := pc.addrq[len(pc.addrq)-1]
+		pc.addrq = pc.addrq[:len(pc.addrq)-1]
+		typ := pc.htypes[addr]
 		
 		obj := d.FindObj(addr)
 		if obj == ObjNil {
 			// Can happen for pointers into stacks (from defers, say)
-			//log.Printf("pointer %x is not to valid heap object addr=%s", addr, typ.Name())
+			//log.Fatalf("pointer %x is not to valid heap object addr=%s", addr, typ.Name())
 			continue
 		}
 		base := d.Addr(obj)
-		data := d.Contents(obj)
+		data := d.Contents(obj)[addr-base:]
 		if typ.Size() > uint64(len(data)) {
-			log.Fatalf("type=%s/%d is too big for object %d", typ.Name(), typ.Size(), len(data))
+			log.Fatalf("type=%s size=%d is too big for object %d", typ.Name(), typ.Size(), len(data))
 		}
-		for _, f := range typ.dwarfFields() {
-			if f.offset >= uint64(len(data)) {
-				log.Fatalf("type too big for object %s %v %d", typ.Name(), f, typ.Size())
-			}
-			switch t := f.type_.(type) {
-			case *dwarfPtrType:
-				if t.elem == nil {
-					break
-				}
-				p := readPtr(d, data[addr + f.offset - base:])
-				if setType(d, htypes, p, t.elem) {
-					addrq = append(addrq, p)
-				}
-			}
-		}
+		data = data[:typ.Size()]
+		scanType(&pc, data, typ)
 	}
 
 	// update types of known objects
@@ -1668,7 +1734,7 @@ func typePropagate(d *Dump, execname string) {
 	for i := 0; i < d.NumObjects(); i++ {
 		x := ObjId(i)
 		addr := d.Addr(x)
-		if t, ok := htypes[addr]; ok {
+		if t, ok := pc.htypes[addr]; ok {
 			ft, ok := dwarfToFull[t]
 			if !ok {
 				ft = &FullType{len(d.FTList), t.Size(), "", t.Name(), nil}
@@ -1680,28 +1746,97 @@ func typePropagate(d *Dump, execname string) {
 	}
 }
 
-func setType(d *Dump, htypes map[uint64]dwarfType, addr uint64, typ dwarfType) bool {
+// "Scan" the object data as if it was the given type.
+func scanType(pc *propagateContext, data []byte, typ dwarfType) {
+	d := pc.d
+	for _, f := range typ.dwarfFields() {
+		if f.offset + f.type_.Size() > uint64(len(data)) {
+			log.Fatalf("field past end of object %s %#v %d", typ.Name(), f)
+		}
+		switch t := f.type_.(type) {
+		case *dwarfPtrType:
+			if t.elem == nil {
+				// t.elem is nil for unsafe.Pointer-like pointers
+				continue
+			}
+			p := readPtr(d, data[f.offset:])
+			setType(pc, p, t.elem)
+		case *dwarfIfaceType:
+			itab := readPtr(d, data[f.offset:])
+			if itab == 0 {
+				continue
+			}
+			it := pc.itab2dwarf[itab]
+			if it == nil {
+				log.Printf("can't find type in iface slot")
+				log.Printf("  itab=%x", itab)
+				log.Printf("  taddr=%x", d.ItabMap[itab])
+				log.Printf("  typ=%s", d.TypeMap[d.ItabMap[itab]].Name)
+				//log.Fatalf("itab entry has no dwarf type")
+				continue
+			}
+			p := readPtr(d, data[f.offset+d.PtrSize:])
+			setType(pc, p, it)
+		case *dwarfEfaceType:
+			/*
+			addr := readPtr(d, data[f.offset:])
+			if addr == 0 {
+				continue
+			}
+			it := pc.type2dwarf[addr]
+			if it == nil {
+				log.Printf("can't find type in eface slot")
+				log.Printf("  addr=%x", addr)
+				log.Printf("  typ=%s", d.TypeMap[addr].Name)
+				continue
+			}
+			p := readPtr(d, data[f.offset+d.PtrSize:])
+			setType(pc, p, it)
+*/
+		case *dwarfBaseType:
+			// nothing to do
+		default:
+			log.Fatalf("unknown type for field %#v", f)
+		}
+	}
+}
+
+func setType(pc *propagateContext, addr uint64, typ dwarfType) {
+	d := pc.d
 	if addr < d.HeapStart || addr >= d.HeapEnd {
-		return false
+		return
 	}
 	obj := d.FindObj(addr)
-	if obj != ObjNil {
-		if addr + typ.Size() > d.Addr(obj) + d.Size(obj) {
-			log.Fatalf("dwarf type larger than object addr=%x typ=%s typsize=%x objaddr=%x objsize=%x", addr, typ.Name(), typ.Size(), d.Addr(obj), d.Size(obj))
+	if obj == ObjNil {
+		// pointer into heap, but not to any object
+		// can happen for defers pointing to stacks
+		log.Printf("heap ptr %x doesn't point to an object", addr)
+		return
+	}
+	if addr + typ.Size() > d.Addr(obj) + d.Size(obj) {
+		log.Fatalf("dwarf type larger than object addr=%x typ=%s typsize=%x objaddr=%x objsize=%x", addr, typ.Name(), typ.Size(), d.Addr(obj), d.Size(obj))
+	}
+	if oldtyp, ok := pc.htypes[addr]; ok {
+		if typ == oldtyp {
+			return
+		}
+		// multiple types for the same address happen for channels of struct{},
+		// the buf points back to the channel itself as type *byte.
+		log.Printf("type mismatch in heap %x %s %s", addr, oldtyp.Name(), typ.Name())
+
+		// TODO: different types are allowed, if one is a prefix of the other.  Check that.
+		
+		// Use bigger type.
+		if oldtyp.Size() >= typ.Size() {
+			return
 		}
 	}
-	if oldtyp, ok := htypes[addr]; ok {
-		if typ != oldtyp {
-			// this happens for channels of struct{}, the buf points back to the
-			// channel itself.
-			log.Printf("type mismatch in heap %x %s %s", addr, oldtyp.Name(), typ.Name())
-		}
-		// TODO: containment should be allowed.  Pick bigger type.
-		return false
-	}
-	htypes[addr] = typ
+
+	// set type, queue object for scanning
+	pc.htypes[addr] = typ
+	pc.addrq = append(pc.addrq, addr)
 	//fmt.Printf("%x: %s\n", addr, typ.Name())
-	return true
+	return
 }
 
 // Names the fields it can for better debugging output
