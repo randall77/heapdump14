@@ -1586,19 +1586,14 @@ func (d *Dump) appendFields(edges []Edge, data []byte, fields []Field) []Edge {
 // Matches a package path, e.g. code.google.com/p/go.tools/go/types.Var
 var pathRegexp = regexp.MustCompile(`([\w./])+`)
 
-// packageFromPath extracts the package name from the end of a package path.
-func packageFromPath(s string) string {
+// packageFromPath extracts the simple type name from the end of a package path.
+// e.g. code.google.com/p/go.tools/go/types.Var -> types.Var
+func typeFromPath(s string) string {
 	i := strings.LastIndex(s, "/")
 	if i == -1 {
 		return s
 	}
 	return s[i+1:]
-}
-
-// Returns true if the runtime type t matches the dwarf type dt.
-// We're looking to match something like *gob.CommonType with *encoding/gob.CommonType
-func typeMatch(t, dt string) bool {
-	return t == pathRegexp.ReplaceAllStringFunc(dt, packageFromPath)
 }
 
 type propagateContext struct {
@@ -1632,25 +1627,22 @@ func typePropagate(d *Dump, execname string) {
 	// some runtime type names have just package names instead of package paths, e.g.
 	// gob.CommonType instead of encoding/gob.CommonType.
 	// TODO: matching types by name is very error prone.  There's got to be a better way.
-	// If there is a unique mapping from runtime type to dwarf type, use it.
-	// This is O(n^2) in number of types.
-	for _, typ := range d.TypeMap {
-		var match dwarfType
-		for _, dt := range t {
-			if typeMatch(typ.Name, dt.Name()) {
-				if match == nil {
-					// first match - remember it
-					match = dt
-				} else {
-					// more than one match - can't be certain
-					//log.Printf("double match for %s: %s and %s", typ.Name, match.Name(), dt.Name())
-					match = nil
-					break
-				}
+	// For now, if there is a unique mapping from runtime type to dwarf type, use it.
+	short2long := map[string][]dwarfType{}
+	for n, dt := range name2dwarf {
+		n = pathRegexp.ReplaceAllStringFunc(n, typeFromPath)
+		short2long[n] = append(short2long[n], dt)
+	}
+	for n, a := range short2long {
+		if len(a) > 1 {
+			log.Printf("ambiguous type %s", n)
+			for _, dt := range a {
+				log.Printf("  %s", dt.Name())
 			}
 		}
-		if match != nil {
-			name2dwarf[typ.Name] = match
+		if len(a) == 1 {
+			// the short name matches a unique long name.
+			name2dwarf[n] = a[0]
 		}
 	}
 
@@ -1691,6 +1683,7 @@ func typePropagate(d *Dump, execname string) {
 	pc.htypes = map[uint64]dwarfType{}
 
 	// set types of objects which are pointed to by globals
+	log.Printf("globals")
 	for _, r := range globalRoots(d, w, t) {
 		var data []byte
 		switch {
@@ -1708,7 +1701,7 @@ func typePropagate(d *Dump, execname string) {
 
 	// set types of objects which are pointed to by stacks
 	layouts := frameLayouts(d, w, t)
-	log.Printf("locals & args\n")
+	log.Printf("locals & args")
 	live := map[uint64]bool{}
 	for _, g := range d.Goroutines {
 		var c *StackFrame
