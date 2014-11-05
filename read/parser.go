@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strings"
 )
 
 type FieldKind int
@@ -1582,6 +1583,24 @@ func (d *Dump) appendFields(edges []Edge, data []byte, fields []Field) []Edge {
 	return edges
 }
 
+// Matches a package path, e.g. code.google.com/p/go.tools/go/types.Var
+var pathRegexp = regexp.MustCompile(`([\w./])+`)
+
+// packageFromPath extracts the package name from the end of a package path.
+func packageFromPath(s string) string {
+	i := strings.LastIndex(s, "/")
+	if i == -1 {
+		return s
+	}
+	return s[i+1:]
+}
+
+// Returns true if the runtime type t matches the dwarf type dt.
+// We're looking to match something like *gob.CommonType with *encoding/gob.CommonType
+func typeMatch(t, dt string) bool {
+	return t == pathRegexp.ReplaceAllStringFunc(dt, packageFromPath)
+}
+
 type propagateContext struct {
 	d *Dump
 
@@ -1596,7 +1615,8 @@ type propagateContext struct {
 }
 
 func typePropagate(d *Dump, execname string) {
-	// TODO: special case the unsafe.Pointer in reflect.value
+	// TODO: special case the unsafe.Pointer in reflect.value.  We can compute
+	// the type of the thing it points to in this case.
 	w := getDwarf(execname)
 	t := dwarfTypeMap(d, w)
 
@@ -1607,6 +1627,31 @@ func typePropagate(d *Dump, execname string) {
 	name2dwarf := map[string]dwarfType{}
 	for _, typ := range t {
 		name2dwarf[typ.Name()] = typ
+	}
+
+	// some runtime type names have just package names instead of package paths, e.g.
+	// gob.CommonType instead of encoding/gob.CommonType.
+	// TODO: matching types by name is very error prone.  There's got to be a better way.
+	// If there is a unique mapping from runtime type to dwarf type, use it.
+	// This is O(n^2) in number of types.
+	for _, typ := range d.TypeMap {
+		var match dwarfType
+		for _, dt := range t {
+			if typeMatch(typ.Name, dt.Name()) {
+				if match == nil {
+					// first match - remember it
+					match = dt
+				} else {
+					// more than one match - can't be certain
+					//log.Printf("double match for %s: %s and %s", typ.Name, match.Name(), dt.Name())
+					match = nil
+					break
+				}
+			}
+		}
+		if match != nil {
+			name2dwarf[typ.Name] = match
+		}
 	}
 
 	// map from type address to dwarf type (for resolving efaces)
