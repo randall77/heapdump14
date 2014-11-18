@@ -1719,6 +1719,7 @@ func setType(pc *propagateContext, addr uint64, typ dwarfType) {
 		}
 		// multiple types for the same address happen for channels of struct{},
 		// the buf points back to the channel itself as type *byte.
+		// TODO: make hchan.buf an unsafe.Pointer so we don't get this warning.
 		log.Printf("type mismatch in heap %x %s %s", addr, oldtyp.Name(), typ.Name())
 
 		// TODO: types with different names but identical layout are allowed.
@@ -1762,8 +1763,8 @@ func checkType(d *Dump, addr uint64, typ dwarfType) {
 		}
 		return
 	}
-	start /= d.PtrSize
 	s := d.Ft(obj).GCSig
+	start /= d.PtrSize
 	if start < uint64(len(s)) {
 		s = s[start:]
 	} else {
@@ -1816,23 +1817,6 @@ func nameWithDwarf(d *Dump, execname string) {
 	w := getDwarf(execname)
 	t := dwarfTypeMap(d, w)
 
-	// link up frames in sequence
-	// TODO: already do this later in link
-	frames := make(map[frameKey]*StackFrame, len(d.Frames))
-	for _, x := range d.Frames {
-		frames[frameKey{x.Addr, x.Depth}] = x
-	}
-	for _, f := range d.Frames {
-		if f.Depth == 0 {
-			continue
-		}
-		g := frames[frameKey{f.childaddr, f.Depth - 1}]
-		g.Parent = f
-	}
-	for _, g := range d.Goroutines {
-		g.Bos = frames[frameKey{g.bosaddr, 0}]
-	}
-
 	// name all frame fields
 	layouts := frameLayouts(d, w, t)
 	for _, g := range d.Goroutines {
@@ -1852,7 +1836,7 @@ func nameWithDwarf(d *Dump, execname string) {
 			if c != nil {
 				_, ok := layouts[c.Name]
 				if !ok {
-					log.Printf("no locals layout for %s", r.Name)
+					log.Printf("no locals layout for %s", c.Name)
 				}
 				for _, arg := range layouts[c.Name].args {
 					for _, f := range arg.type_.dwarfFields() {
@@ -1864,9 +1848,11 @@ func nameWithDwarf(d *Dump, execname string) {
 			for i, f := range r.Fields {
 				v, ok := vars[f.Offset]
 				if !ok {
-					// unknown, for whatever reason
-					log.Printf("unknown field in %s @ %d", r.Name, f.Offset)
+					// Live ptr variable in frame has no dwarf type.  This seems to happen
+					// for autotemps which get suppressed by the dwarf generator.
+					//log.Printf("unknown field in %s @ %d (framesize=%d)", r.Name, f.Offset, len(r.Data))
 					r.Fields[i].Name = fmt.Sprintf("~%d", f.Offset)
+					r.Fields[i].BaseType = "&lt;unknown&gt;"
 					continue
 				}
 				r.Fields[i].Name = v.name
@@ -1876,7 +1862,7 @@ func nameWithDwarf(d *Dump, execname string) {
 		}
 	}
 
-	// naming for globals
+	// name all globals
 	gm := map[uint64]nameType{}
 	for _, g := range globalRoots(d, w, t) {
 		for _, f := range g.type_.dwarfFields() {
