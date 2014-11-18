@@ -1710,6 +1710,9 @@ func setType(pc *propagateContext, addr uint64, typ dwarfType) {
 	if addr+typ.Size() > d.Addr(obj)+d.Size(obj) {
 		log.Fatalf("dwarf type larger than object addr=%x typ=%s typsize=%x objaddr=%x objsize=%x", addr, typ.Name(), typ.Size(), d.Addr(obj), d.Size(obj))
 	}
+	
+	checkType(d, addr, typ)
+
 	if oldtyp, ok := pc.htypes[addr]; ok {
 		if typ == oldtyp {
 			return
@@ -1718,6 +1721,7 @@ func setType(pc *propagateContext, addr uint64, typ dwarfType) {
 		// the buf points back to the channel itself as type *byte.
 		log.Printf("type mismatch in heap %x %s %s", addr, oldtyp.Name(), typ.Name())
 
+		// TODO: types with different names but identical layout are allowed.
 		// TODO: different types are allowed, if one is a prefix of the other.  Check that.
 
 		// Use the bigger type.
@@ -1730,7 +1734,76 @@ func setType(pc *propagateContext, addr uint64, typ dwarfType) {
 	pc.htypes[addr] = typ
 	pc.addrq = append(pc.addrq, addr)
 	//fmt.Printf("%x: %s\n", addr, typ.Name())
-	return
+}
+
+// Check to make sure our type information is consistent.
+// Dwarf info claims that the object at addr has type typ.  Check this info
+// against the gcinfo types recorded in the dump.
+func checkType(d *Dump, addr uint64, typ dwarfType) {
+	// TODO: dwarf and runtime disagree about the layout of hchan<nonptrtype>
+	if len(typ.Name()) >= 6 && typ.Name()[:6] == "hchan<" {
+		return
+	}
+
+	obj := d.FindObj(addr)
+
+	start := addr - d.Addr(obj)
+	if start % d.PtrSize != 0 {
+		// not aligned to a pointer - shouldn't contain any pointers
+		for _, f := range typ.dwarfFields() {
+			switch f.type_.(type) {
+			case *dwarfPtrType:
+				log.Fatalf("unaligned type %s has a pointer in it", typ.Name())
+			case *dwarfIfaceType:
+				log.Fatalf("unaligned type %s has an iface in it", typ.Name())
+			case *dwarfEfaceType:
+				log.Fatalf("unaligned type %s has an eface in it", typ.Name())
+			}
+		}
+		return
+	}
+	start /= d.PtrSize
+	s := d.Ft(obj).GCSig
+	if start < uint64(len(s)) {
+		s = s[start:]
+	} else {
+		s = ""
+	}
+	end := typ.Size() / d.PtrSize
+	if end < uint64(len(s)) {
+		s = s[:end]
+	}
+	// TODO: figure out how to check arrays.  Right now we only check one T at the target of any *T,
+	// but for slices we should check lots of T (up to the capacity of the slice).
+	n := 0
+	for _, f := range typ.dwarfFields() {
+		off := f.offset/d.PtrSize
+		switch f.type_.(type) {
+		case *dwarfPtrType:
+			if off >= uint64(len(s)) || s[off] != 'P' {
+				log.Fatalf("dwarf type %s has pointer @ %d, gc type %s does not", typ.Name(), off, s)
+			}
+			n++
+		case *dwarfIfaceType:
+			if off >= uint64(len(s)-1) || s[off] != 'I' && s[off+1] != 'I' {
+				log.Fatalf("dwarf type %s has iface, gc type %s does not", typ.Name(), s)
+			}
+			n+=2
+		case *dwarfEfaceType:
+			if off >= uint64(len(s)-1) && s[off] != 'E' && s[off+1] != 'E' {
+				log.Fatalf("dwarf type %s has eface, gc type %s does not", typ.Name(), s)
+			}
+			n+=2
+		}
+	}
+	for _, c := range s {
+		if c == 'P' || c == 'I' || c == 'E' {
+			n--
+		}
+	}
+	if n != 0 {
+		log.Printf("dwarf type %s has a different number of pointers than gc type %s", typ.Name(), s)
+	}
 }
 
 type nameType struct {
@@ -1742,61 +1815,6 @@ type nameType struct {
 func nameWithDwarf(d *Dump, execname string) {
 	w := getDwarf(execname)
 	t := dwarfTypeMap(d, w)
-
-	// name fields in all types
-	m := make(map[string]dwarfType)
-	for _, x := range t {
-		m[x.Name()] = x
-	}
-	for _, t := range d.Types {
-		dt := m[t.Name]
-		if dt == nil {
-			// A type in the dump has no entry in the Dwarf info.
-			// This can happen for unexported types, e.g. reflect.ptrGC.
-			//log.Printf("type %s has no dwarf info", t.Name)
-			continue
-		}
-		// Check that the Dwarf type is consistent with the type we got from
-		// the heap dump.  The heap dump type is the root truth, but it is
-		// missing non-pointer-bearing fields and has no field names.  If the
-		// Dwarf type is consistent with the heap dump type, then we'll use
-		// the fields from the Dwarf type instead.
-		consistent := true
-
-		// load Dwarf fields into layout
-		df := dt.Fields()
-		log.Print(df)
-		layout := make(map[uint64]Field)
-		for _, f := range df {
-			layout[f.Offset] = f
-		}
-		log.Print(layout)
-		log.Print(t.Fields)
-		// A field in the heap dump must match the corresponding Dwarf field
-		// in both kind and offset.
-		for _, f := range t.Fields {
-			if layout[f.Offset].Kind != f.Kind {
-				log.Printf("dwarf field kind doesn't match dump kind %s.%d dwarf=%d dump=%d", t.Name, f.Offset, layout[f.Offset].Kind, f.Kind)
-				consistent = false
-			}
-			delete(layout, f.Offset)
-		}
-		// all remaining fields must not be pointer-containing
-		for _, f := range layout {
-			switch f.Kind {
-			case FieldKindPtr, FieldKindIface, FieldKindEface:
-				log.Printf("dwarf type has additional ptr field %s %d %d", f.Name, f.Offset, f.Kind)
-				consistent = false
-			}
-		}
-		if consistent {
-			// Dwarf info looks good, overwrite the fields from the dump
-			// with fields from the Dwarf info.
-			t.Fields = df
-		} else {
-			log.Print("inconsistent type for ", t.Name)
-		}
-	}
 
 	// link up frames in sequence
 	// TODO: already do this later in link
