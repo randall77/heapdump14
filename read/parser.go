@@ -94,7 +94,6 @@ const (
 type Dump struct {
 	Order        binary.ByteOrder
 	PtrSize      uint64 // in bytes
-	HChanSize    uint64 // channel header size in bytes
 	HeapStart    uint64
 	HeapEnd      uint64
 	TheChar      byte
@@ -141,10 +140,10 @@ type Dump struct {
 }
 
 type Type struct {
-	Name     string // not necessarily unique
-	Size     uint64
-	efaceptr bool    // interfaces with this type store the (pointer-like) value directly
-	Fields   []Field // ordered in increasing offset order
+	Name         string // not necessarily unique
+	Size         uint64
+	interfaceptr bool    // interfaces with this type have a pointer in their data field
+	Fields       []Field // ordered in increasing offset order
 
 	Addr uint64
 }
@@ -252,7 +251,7 @@ func (d *Dump) Edges(i ObjId) []Edge {
 				if t == nil {
 					log.Fatalf("Edges: can't find eface type %x", taddr)
 				}
-				if t.efaceptr {
+				if t.interfaceptr {
 					p := readPtr(d, b[f.Offset+d.PtrSize:])
 					y := d.FindObj(p)
 					if y != ObjNil {
@@ -271,7 +270,7 @@ func (d *Dump) Edges(i ObjId) []Edge {
 				if t == nil {
 					log.Fatalf("Edges: can't find iface type %x", taddr)
 				}
-				if t.efaceptr {
+				if t.interfaceptr {
 					p := readPtr(d, b[f.Offset+d.PtrSize:])
 					y := d.FindObj(p)
 					if y != ObjNil {
@@ -592,7 +591,7 @@ func rawRead(filename string) *Dump {
 			typ.Addr = readUint64(r)
 			typ.Size = readUint64(r)
 			typ.Name = readString(r)
-			typ.efaceptr = readBool(r)
+			typ.interfaceptr = readBool(r)
 			// Note: there may be duplicate type records in a dump.
 			// The duplicates get thrown away here.
 			if _, ok := d.TypeMap[typ.Addr]; !ok {
@@ -990,26 +989,6 @@ func (t *dwarfStructType) Fields() []Field {
 	case t.name == "runtime.eface":
 		t.fields = append(t.fields, Field{FieldKindEface, 0, "", ""}, Field{FieldKindEface, 0, "", ""})
 	default:
-		/*
-			// Detect slices.  TODO: This could be fooled by the right user
-			// code, so find a better way.
-			if len(t.members) == 3 &&
-				t.members[0].name == "array" &&
-				t.members[1].name == "len" &&
-				t.members[2].name == "cap" &&
-				t.members[0].offset == 0 &&
-				t.members[1].offset == t.members[0].type_.Size() &&
-				t.members[2].offset == 2*t.members[0].type_.Size() {
-				_, aok := t.members[0].type_.(*dwarfPtrType)
-				l, lok := t.members[1].type_.(*dwarfBaseType)
-				c, cok := t.members[2].type_.(*dwarfBaseType)
-				if aok && lok && cok && l.encoding == dw_ate_unsigned && c.encoding == dw_ate_unsigned {
-					t.fields = append(t.fields, Field{FieldKindSlice, 0, "", t.members[0].type_.Name()[1:]})
-					break
-				}
-			}
-		*/
-
 		for _, m := range t.members {
 			for _, f := range m.type_.Fields() {
 				t.fields = append(t.fields, Field{f.Kind, m.offset + f.Offset, joinNames(m.name, f.Name), f.BaseType})
@@ -1095,6 +1074,22 @@ func (t *dwarfEfaceType) dwarfFields() []dwarfTypeMember {
 		t.dFields = append(t.dFields, dwarfTypeMember{0, "", t})
 	}
 	return t.dFields
+}
+
+// baseType returns a string representing the base type of this dwarf type,
+// or "" if the base type makes no sense.
+func baseType(t dwarfType) string {
+	switch t := t.(type) {
+	case *dwarfPtrType:
+		if t.elem == nil {
+			return "&lt;unknown&gt;"
+		} else {
+			return t.elem.Name()
+		}
+		// TODO: iface, func?
+	default:
+		return ""
+	}
 }
 
 // Some type names in the dwarf info don't match the corresponding
@@ -1260,150 +1255,10 @@ func dwarfTypeMap(d *Dump, w *dwarf.Data) map[dwarf.Offset]dwarfType {
 			currentStruct.members = append(currentStruct.members, dwarfTypeMember{offset, name, type_})
 		}
 	}
-
-	// TODO: remove
-	if false {
-		for _, typ := range t {
-			fmt.Println(typ.Name())
-			n := 0
-			for _, f := range typ.dwarfFields() {
-				if f.type_ != nil {
-					fmt.Printf("  %d %s %s\n", f.offset, f.name, f.type_.Name())
-				} else {
-					fmt.Printf("  %d %s ==NIL==\n", f.offset, f.name)
-				}
-				n++
-				if n > 100 {
-					break
-				}
-			}
-		}
-	}
 	return t
 }
 
-type localKey struct {
-	funcname string
-	offset   uint64 // distance down from frame pointer
-}
-
-// Makes a map from <function name, distance before top of frame> to name of field.
-func localsMap(d *Dump, w *dwarf.Data, t map[dwarf.Offset]dwarfType) map[localKey]string {
-	m := make(map[localKey]string, 0)
-	r := w.Reader()
-	var funcname string
-	for {
-		e, err := r.Next()
-		if err != nil {
-			log.Fatal(err)
-		}
-		if e == nil {
-			break
-		}
-		switch e.Tag {
-		case dwarf.TagSubprogram:
-			funcname = e.Val(dwarf.AttrName).(string)
-		case dwarf.TagVariable:
-			name := e.Val(dwarf.AttrName).(string)
-			typ := t[e.Val(dwarf.AttrType).(dwarf.Offset)]
-			loc := e.Val(dwarf.AttrLocation).([]uint8)
-			if len(loc) == 0 || loc[0] != dw_op_call_frame_cfa {
-				break
-			}
-			var offset int64
-			if len(loc) == 1 {
-				offset = 0
-			} else if len(loc) >= 3 && loc[1] == dw_op_consts && loc[len(loc)-1] == dw_op_plus {
-				loc, offset = readSleb(loc[2 : len(loc)-1])
-				if len(loc) != 0 {
-					break
-				}
-			}
-			for _, f := range typ.Fields() {
-				m[localKey{funcname, uint64(-offset) - f.Offset}] = joinNames(name, f.Name)
-			}
-		}
-	}
-	return m
-}
-
-// Makes a map from <function name, offset in arg area> to name of field.
-func argsMap(d *Dump, w *dwarf.Data, t map[dwarf.Offset]dwarfType) map[localKey]string {
-	m := make(map[localKey]string, 0)
-	r := w.Reader()
-	var funcname string
-	for {
-		e, err := r.Next()
-		if err != nil {
-			log.Fatal(err)
-		}
-		if e == nil {
-			break
-		}
-		switch e.Tag {
-		case dwarf.TagSubprogram:
-			funcname = e.Val(dwarf.AttrName).(string)
-		case dwarf.TagFormalParameter:
-			if e.Val(dwarf.AttrName) == nil {
-				continue
-			}
-			name := e.Val(dwarf.AttrName).(string)
-			typ := t[e.Val(dwarf.AttrType).(dwarf.Offset)]
-			loc := e.Val(dwarf.AttrLocation).([]uint8)
-			if len(loc) == 0 || loc[0] != dw_op_call_frame_cfa {
-				break
-			}
-			var offset int64
-			if len(loc) == 1 {
-				offset = 0
-			} else if len(loc) >= 3 && loc[1] == dw_op_consts && loc[len(loc)-1] == dw_op_plus {
-				loc, offset = readSleb(loc[2 : len(loc)-1])
-				if len(loc) != 0 {
-					break
-				}
-			}
-			for _, f := range typ.Fields() {
-				m[localKey{funcname, uint64(offset)}] = joinNames(name, f.Name)
-			}
-		}
-	}
-	return m
-}
-
-// map from global address to Field at that address
-func globalsMap(d *Dump, w *dwarf.Data, t map[dwarf.Offset]dwarfType) *heap {
-	h := new(heap)
-	r := w.Reader()
-	for {
-		e, err := r.Next()
-		if err != nil {
-			log.Fatal(err)
-		}
-		if e == nil {
-			break
-		}
-		if e.Tag != dwarf.TagVariable {
-			continue
-		}
-		name := e.Val(dwarf.AttrName).(string)
-		typ := t[e.Val(dwarf.AttrType).(dwarf.Offset)]
-		locexpr := e.Val(dwarf.AttrLocation).([]uint8)
-		if len(locexpr) == 0 || locexpr[0] != dw_op_addr {
-			continue
-		}
-		loc := readPtr(d, locexpr[1:])
-		if typ == nil {
-			// lots of non-Go global symbols hit here (rodata, reflect.cvtFloat·f, ...)
-			h.Insert(loc, Field{FieldKindPtr, 0, "~" + name, ""})
-			continue
-		}
-		for _, f := range typ.Fields() {
-			h.Insert(loc+f.Offset, Field{f.Kind, 0, joinNames(name, f.Name), f.BaseType})
-		}
-	}
-	return h
-}
-
+// globalRoots extracts a list of global variables.  The offsets are addresses.
 func globalRoots(d *Dump, w *dwarf.Data, t map[dwarf.Offset]dwarfType) []dwarfTypeMember {
 	var roots []dwarfTypeMember
 	r := w.Reader()
@@ -1508,6 +1363,17 @@ func frameLayouts(d *Dump, w *dwarf.Data, t map[dwarf.Offset]dwarfType) map[stri
 	if funcname != "" {
 		m[funcname] = frameLayout{locals, args}
 	}
+	/* TODO: remove
+	for name, layout := range m {
+		log.Printf("func %s\n", name)
+		for _, arg := range layout.args {
+			log.Printf("    arg %s @ %d %s\n", arg.name, arg.offset, arg.type_.Name())
+		}
+		for _, local := range layout.locals {
+			log.Printf("  local %s @ %d %s\n", local.name, local.offset, local.type_.Name())
+		}
+	}
+	*/
 	return m
 }
 
@@ -1556,7 +1422,7 @@ func (d *Dump) appendFields(edges []Edge, data []byte, fields []Field) []Edge {
 			if t == nil {
 				log.Fatalf("can't find eface type %x", taddr)
 			}
-			if t.efaceptr {
+			if t.interfaceptr {
 				edges = d.appendEdge(edges, data, off+d.PtrSize, f)
 			}
 		case FieldKindIface:
@@ -1576,7 +1442,7 @@ func (d *Dump) appendFields(edges []Edge, data []byte, fields []Field) []Edge {
 			if t == nil {
 				log.Fatalf("can't find type for itab %x", taddr)
 			}
-			if t.efaceptr {
+			if t.interfaceptr {
 				edges = d.appendEdge(edges, data, off+d.PtrSize, f)
 			}
 		}
@@ -1611,7 +1477,8 @@ type propagateContext struct {
 }
 
 func typePropagate(d *Dump, execname string) {
-	// TODO: special case the unsafe.Pointer in reflect.value.  We can compute
+	fmt.Println("inferring types...")
+	// TODO: special case the unsafe.Pointer in reflect.Value.  We can compute
 	// the type of the thing it points to in this case.
 	w := getDwarf(execname)
 	t := dwarfTypeMap(d, w)
@@ -1641,10 +1508,11 @@ func typePropagate(d *Dump, execname string) {
 			name2dwarf[n] = a[0]
 			continue
 		}
-		log.Printf("ambiguous type %s", n)
+		log.Printf("Type %s is ambiguous.  Could be any of:", n)
 		for _, dt := range a {
 			log.Printf("  %s", dt.Name())
 		}
+		// TODO: use fields to disambiguate
 	}
 
 	// map from type address to dwarf type (for resolving efaces)
@@ -1655,7 +1523,7 @@ func typePropagate(d *Dump, execname string) {
 			log.Printf("can't find type %s", typ.Name)
 			continue
 		}
-		if typ.efaceptr {
+		if typ.interfaceptr { // TODO: not right.  Fix.
 			// We want typ to be the pointed-to object's type.
 			// Interfaces store pointers directly, so the target's type
 			// needs a dereference.
@@ -1678,7 +1546,7 @@ func typePropagate(d *Dump, execname string) {
 	pc.htypes = map[uint64]dwarfType{}
 
 	// set types of objects which are pointed to by globals
-	log.Printf("globals")
+	log.Printf("  Global variables...")
 	for _, r := range globalRoots(d, w, t) {
 		var data []byte
 		switch {
@@ -1696,10 +1564,9 @@ func typePropagate(d *Dump, execname string) {
 
 	// set types of objects which are pointed to by stacks
 	layouts := frameLayouts(d, w, t)
-	log.Printf("stacks")
+	log.Printf("  Stacks...")
 	live := map[uint64]bool{}
 	for _, g := range d.Goroutines {
-		var c *StackFrame
 		for r := g.Bos; r != nil; r = r.Parent {
 			//log.Printf("func %s %x", r.Name, len(r.Data))
 			for k := range live {
@@ -1726,22 +1593,18 @@ func typePropagate(d *Dump, execname string) {
 				// dead, not a mix of the two.
 				continue
 			islive:
+				//log.Printf("  local %s/%s @ %x", r.Name, local.name, local.offset)
 				scanType(&pc, r.Data[i:], local.type_)
 			}
-			if c != nil {
-				// find pointers in outargs section
-				// arg section is always live
-				for _, arg := range layouts[c.Name].args {
-					//log.Printf("  arg %s @ %x", arg.name, arg.offset)
-					scanType(&pc, r.Data[arg.offset:], arg.type_)
-				}
+
+			for _, arg := range layouts[r.Name].args {
+				//log.Printf("  arg %s/%s @ %x", r.Name, arg.name, arg.offset)
+				scanType(&pc, r.Parent.Data[arg.offset:], arg.type_)
 			}
-			c = r
 		}
 	}
 
 	// propagate types
-	log.Println("propagating")
 	for len(pc.addrq) > 0 {
 		addr := pc.addrq[len(pc.addrq)-1]
 		pc.addrq = pc.addrq[:len(pc.addrq)-1]
@@ -1779,7 +1642,8 @@ func typePropagate(d *Dump, execname string) {
 	}
 }
 
-// "Scan" the object data as if it was the given type.
+// "Scan" the object data as if it was the given type, possibly finding types
+// of other objects that this one points to.
 func scanType(pc *propagateContext, data []byte, typ dwarfType) {
 	d := pc.d
 	for _, f := range typ.dwarfFields() {
@@ -1869,6 +1733,11 @@ func setType(pc *propagateContext, addr uint64, typ dwarfType) {
 	return
 }
 
+type nameType struct {
+	name  string
+	type_ dwarfType
+}
+
 // Names the fields it can for better debugging output
 func nameWithDwarf(d *Dump, execname string) {
 	w := getDwarf(execname)
@@ -1947,43 +1816,63 @@ func nameWithDwarf(d *Dump, execname string) {
 	}
 
 	// name all frame fields
-	locals := localsMap(d, w, t)
-	args := argsMap(d, w, t)
+	layouts := frameLayouts(d, w, t)
 	for _, g := range d.Goroutines {
 		var c *StackFrame
 		for r := g.Bos; r != nil; r = r.Parent {
-			for i, f := range r.Fields {
-				name := locals[localKey{r.Name, uint64(len(r.Data)) - f.Offset}]
-				if name == "" && c != nil {
-					name = args[localKey{c.Name, f.Offset}]
-					if name != "" {
-						name = "outarg." + name
+			_, ok := layouts[r.Name]
+			if !ok {
+				log.Printf("no locals layout for %s", r.Name)
+			}
+			// make maps from offset to field name & type
+			vars := map[uint64]nameType{}
+			for _, local := range layouts[r.Name].locals {
+				for _, f := range local.type_.dwarfFields() {
+					vars[uint64(len(r.Data))-local.offset+f.offset] = nameType{joinNames(local.name, f.name), f.type_}
+				}
+			}
+			if c != nil {
+				_, ok := layouts[c.Name]
+				if !ok {
+					log.Printf("no locals layout for %s", r.Name)
+				}
+				for _, arg := range layouts[c.Name].args {
+					for _, f := range arg.type_.dwarfFields() {
+						vars[arg.offset+f.offset] = nameType{joinNames("outarg."+arg.name, f.name), f.type_}
 					}
 				}
-				if name == "" {
-					name = fmt.Sprintf("~%d", f.Offset)
+			}
+
+			for i, f := range r.Fields {
+				v, ok := vars[f.Offset]
+				if !ok {
+					// unknown, for whatever reason
+					log.Printf("unknown field in %s @ %d", r.Name, f.Offset)
+					r.Fields[i].Name = fmt.Sprintf("~%d", f.Offset)
+					continue
 				}
-				r.Fields[i].Name = name
+				r.Fields[i].Name = v.name
+				r.Fields[i].BaseType = baseType(v.type_)
 			}
 			c = r
 		}
 	}
 
 	// naming for globals
-	globals := globalsMap(d, w, t)
+	gm := map[uint64]nameType{}
+	for _, g := range globalRoots(d, w, t) {
+		for _, f := range g.type_.dwarfFields() {
+			gm[g.offset+f.offset] = nameType{joinNames(g.name, f.name), f.type_}
+		}
+	}
 	for _, x := range []*Data{d.Data, d.Bss} {
 		for i, f := range x.Fields {
-			addr := x.Addr + f.Offset
-			a, v := globals.Lookup(addr)
-			if v == nil {
+			nt, ok := gm[x.Addr+f.Offset]
+			if !ok {
 				continue
 			}
-			ff := v.(Field)
-			if a != addr {
-				ff.Name = fmt.Sprintf("%s:%d", ff.Name, addr-a)
-			}
-			ff.Offset = f.Offset
-			x.Fields[i] = ff
+			x.Fields[i].Name = nt.name
+			x.Fields[i].BaseType = baseType(nt.type_)
 		}
 	}
 }
@@ -2102,23 +1991,6 @@ func nameFallback(d *Dump) {
 	}
 }
 
-// needs to be kept in sync with src/pkg/runtime/chan.h in
-// the main Go distribution.
-var chanFields = map[uint64]map[uint64]string{
-	4: map[uint64]string{
-		0:  "len",
-		4:  "cap",
-		20: "next send index",
-		24: "next receive index",
-	},
-	8: map[uint64]string{
-		0:  "len",
-		8:  "cap",
-		32: "next send index",
-		40: "next receive index",
-	},
-}
-
 func nameFullTypes(d *Dump) {
 	for _, ft := range d.FTList {
 		if ft.Type == nil {
@@ -2226,7 +2098,7 @@ func Read(dumpname, execname string) *Dump {
 	link1(d)
 	if execname != "" {
 		typePropagate(d, execname)
-		//nameWithDwarf(d, execname)
+		nameWithDwarf(d, execname)
 	} else {
 		nameFallback(d)
 	}

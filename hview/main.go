@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/randall77/heapdump14/read"
 	"html"
 	"log"
 	"net/http"
@@ -13,6 +12,8 @@ import (
 	"sort"
 	"strconv"
 	"text/template"
+
+	"github.com/randall77/heapdump14/read"
 )
 
 const (
@@ -969,7 +970,7 @@ var byType []bucket
 
 func prepare() {
 	// group objects by type
-	fmt.Println("grouping")
+	fmt.Println("Grouping by type...")
 	byType = make([]bucket, len(d.FTList))
 	for i := 0; i < d.NumObjects(); i++ {
 		x := read.ObjId(i)
@@ -981,7 +982,7 @@ func prepare() {
 	}
 
 	// compute referrers
-	fmt.Println("computing referrers")
+	fmt.Println("Computing referrers...")
 	ref1 = make([]read.ObjId, d.NumObjects())
 	for i := 0; i < d.NumObjects(); i++ {
 		ref1[i] = read.ObjNil
