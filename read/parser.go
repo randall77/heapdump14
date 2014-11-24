@@ -919,7 +919,7 @@ func (t *dwarfBaseType) dwarfFields() []dwarfTypeMember {
 	if t.dFields != nil {
 		return t.dFields
 	}
-	t.dFields = append(t.dFields, dwarfTypeMember{0, "", t}) // TODO: infinite recursion?
+	t.dFields = append(t.dFields, dwarfTypeMember{0, "", t})
 	return t.dFields
 }
 
@@ -985,7 +985,7 @@ func (t *dwarfStructType) Fields() []Field {
 
 		t.fields = append(t.fields, Field{FieldKindPtr, 0, "", ""}, Field{FieldKindUInt64, 0, "", ""}) // TODO: uint32 for 32-bit?
 	case t.name == "runtime.iface":
-		t.fields = append(t.fields, Field{FieldKindPtr, 0, "", unkBase}, Field{FieldKindPtr, 0, "", unkBase})
+		t.fields = append(t.fields, Field{FieldKindPtr, 0, "", unkBase}, Field{FieldKindPtr, 0, "", unkBase}) // TODO: different offsets?
 	case t.name == "runtime.eface":
 		t.fields = append(t.fields, Field{FieldKindEface, 0, "", ""}, Field{FieldKindEface, 0, "", ""})
 	default:
@@ -1139,20 +1139,24 @@ func dwarfTypeMap(d *Dump, w *dwarf.Data) map[dwarf.Offset]dwarfType {
 		if e == nil {
 			break
 		}
+		if e.Val(dwarf.AttrName) == nil {
+			// Dwarf info from non-go sources might be missing a name
+			continue
+		}
+		name := fixName(e.Val(dwarf.AttrName).(string))
 		switch e.Tag {
 		case dwarf.TagBaseType:
 			x := new(dwarfBaseType)
-			x.name = fixName(e.Val(dwarf.AttrName).(string))
+			x.name = name
 			x.size = uint64(e.Val(dwarf.AttrByteSize).(int64))
 			x.encoding = e.Val(dwarf.AttrEncoding).(int64)
 			t[e.Offset] = x
 		case dwarf.TagPointerType:
 			x := new(dwarfPtrType)
-			x.name = fixName(e.Val(dwarf.AttrName).(string))
+			x.name = name
 			x.size = d.PtrSize
 			t[e.Offset] = x
 		case dwarf.TagStructType:
-			name := fixName(e.Val(dwarf.AttrName).(string))
 			if name == "runtime.iface" {
 				x := new(dwarfIfaceType)
 				x.name = name
@@ -1177,16 +1181,16 @@ func dwarfTypeMap(d *Dump, w *dwarf.Data) map[dwarf.Offset]dwarfType {
 			t[e.Offset] = x
 		case dwarf.TagArrayType:
 			x := new(dwarfArrayType)
-			x.name = fixName(e.Val(dwarf.AttrName).(string))
+			x.name = name
 			x.size = uint64(e.Val(dwarf.AttrByteSize).(int64))
 			t[e.Offset] = x
 		case dwarf.TagTypedef:
 			x := new(dwarfTypedef)
-			x.name = fixName(e.Val(dwarf.AttrName).(string))
+			x.name = name
 			t[e.Offset] = x
 		case dwarf.TagSubroutineType:
 			x := new(dwarfFuncType)
-			x.name = fixName(e.Val(dwarf.AttrName).(string))
+			x.name = name
 			x.size = d.PtrSize
 			t[e.Offset] = x
 		}
@@ -1363,17 +1367,6 @@ func frameLayouts(d *Dump, w *dwarf.Data, t map[dwarf.Offset]dwarfType) map[stri
 	if funcname != "" {
 		m[funcname] = frameLayout{locals, args}
 	}
-	/* TODO: remove
-	for name, layout := range m {
-		log.Printf("func %s\n", name)
-		for _, arg := range layout.args {
-			log.Printf("    arg %s @ %d %s\n", arg.name, arg.offset, arg.type_.Name())
-		}
-		for _, local := range layout.locals {
-			log.Printf("  local %s @ %d %s\n", local.name, local.offset, local.type_.Name())
-		}
-	}
-	*/
 	return m
 }
 
