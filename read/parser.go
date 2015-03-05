@@ -942,7 +942,7 @@ func (t *dwarfBaseType) dwarfFields() []dwarfTypeMember {
 	if t.dFields != nil {
 		return t.dFields
 	}
-	t.dFields = append(t.dFields, dwarfTypeMember{0, "", t}) // TODO: infinite recursion?
+	t.dFields = append(t.dFields, dwarfTypeMember{0, "", t})
 	return t.dFields
 }
 
@@ -1008,7 +1008,7 @@ func (t *dwarfStructType) Fields() []Field {
 
 		t.fields = append(t.fields, Field{FieldKindPtr, 0, "", ""}, Field{FieldKindUInt64, 0, "", ""}) // TODO: uint32 for 32-bit?
 	case t.name == "runtime.iface":
-		t.fields = append(t.fields, Field{FieldKindPtr, 0, "", unkBase}, Field{FieldKindPtr, 0, "", unkBase})
+		t.fields = append(t.fields, Field{FieldKindPtr, 0, "", unkBase}, Field{FieldKindPtr, 0, "", unkBase}) // TODO: different offsets?
 	case t.name == "runtime.eface":
 		t.fields = append(t.fields, Field{FieldKindEface, 0, "", ""}, Field{FieldKindEface, 0, "", ""})
 	default:
@@ -1162,20 +1162,24 @@ func dwarfTypeMap(d *Dump, w *dwarf.Data) map[dwarf.Offset]dwarfType {
 		if e == nil {
 			break
 		}
+		if e.Val(dwarf.AttrName) == nil {
+			// Dwarf info from non-go sources might be missing a name
+			continue
+		}
+		name := fixName(e.Val(dwarf.AttrName).(string))
 		switch e.Tag {
 		case dwarf.TagBaseType:
 			x := new(dwarfBaseType)
-			x.name = fixName(e.Val(dwarf.AttrName).(string))
+			x.name = name
 			x.size = uint64(e.Val(dwarf.AttrByteSize).(int64))
 			x.encoding = e.Val(dwarf.AttrEncoding).(int64)
 			t[e.Offset] = x
 		case dwarf.TagPointerType:
 			x := new(dwarfPtrType)
-			x.name = fixName(e.Val(dwarf.AttrName).(string))
+			x.name = name
 			x.size = d.PtrSize
 			t[e.Offset] = x
 		case dwarf.TagStructType:
-			name := fixName(e.Val(dwarf.AttrName).(string))
 			if name == "runtime.iface" {
 				x := new(dwarfIfaceType)
 				x.name = name
@@ -1200,16 +1204,16 @@ func dwarfTypeMap(d *Dump, w *dwarf.Data) map[dwarf.Offset]dwarfType {
 			t[e.Offset] = x
 		case dwarf.TagArrayType:
 			x := new(dwarfArrayType)
-			x.name = fixName(e.Val(dwarf.AttrName).(string))
+			x.name = name
 			x.size = uint64(e.Val(dwarf.AttrByteSize).(int64))
 			t[e.Offset] = x
 		case dwarf.TagTypedef:
 			x := new(dwarfTypedef)
-			x.name = fixName(e.Val(dwarf.AttrName).(string))
+			x.name = name
 			t[e.Offset] = x
 		case dwarf.TagSubroutineType:
 			x := new(dwarfFuncType)
-			x.name = fixName(e.Val(dwarf.AttrName).(string))
+			x.name = name
 			x.size = d.PtrSize
 			t[e.Offset] = x
 		}
@@ -1386,17 +1390,6 @@ func frameLayouts(d *Dump, w *dwarf.Data, t map[dwarf.Offset]dwarfType) map[stri
 	if funcname != "" {
 		m[funcname] = frameLayout{locals, args}
 	}
-	/* TODO: remove
-	for name, layout := range m {
-		log.Printf("func %s\n", name)
-		for _, arg := range layout.args {
-			log.Printf("    arg %s @ %d %s\n", arg.name, arg.offset, arg.type_.Name())
-		}
-		for _, local := range layout.locals {
-			log.Printf("  local %s @ %d %s\n", local.name, local.offset, local.type_.Name())
-		}
-	}
-	*/
 	return m
 }
 
@@ -1733,14 +1726,19 @@ func setType(pc *propagateContext, addr uint64, typ dwarfType) {
 	if addr+typ.Size() > d.Addr(obj)+d.Size(obj) {
 		log.Fatalf("dwarf type larger than object addr=%x typ=%s typsize=%x objaddr=%x objsize=%x", addr, typ.Name(), typ.Size(), d.Addr(obj), d.Size(obj))
 	}
+	
+	checkType(d, addr, typ)
+
 	if oldtyp, ok := pc.htypes[addr]; ok {
 		if typ == oldtyp {
 			return
 		}
 		// multiple types for the same address happen for channels of struct{},
 		// the buf points back to the channel itself as type *byte.
+		// TODO: make hchan.buf an unsafe.Pointer so we don't get this warning.
 		log.Printf("type mismatch in heap %x %s %s", addr, oldtyp.Name(), typ.Name())
 
+		// TODO: types with different names but identical layout are allowed.
 		// TODO: different types are allowed, if one is a prefix of the other.  Check that.
 
 		// Use the bigger type.
@@ -1753,7 +1751,76 @@ func setType(pc *propagateContext, addr uint64, typ dwarfType) {
 	pc.htypes[addr] = typ
 	pc.addrq = append(pc.addrq, addr)
 	//fmt.Printf("%x: %s\n", addr, typ.Name())
-	return
+}
+
+// Check to make sure our type information is consistent.
+// Dwarf info claims that the object at addr has type typ.  Check this info
+// against the gcinfo types recorded in the dump.
+func checkType(d *Dump, addr uint64, typ dwarfType) {
+	// TODO: dwarf and runtime disagree about the layout of hchan<nonptrtype>
+	if len(typ.Name()) >= 6 && typ.Name()[:6] == "hchan<" {
+		return
+	}
+
+	obj := d.FindObj(addr)
+
+	start := addr - d.Addr(obj)
+	if start % d.PtrSize != 0 {
+		// not aligned to a pointer - shouldn't contain any pointers
+		for _, f := range typ.dwarfFields() {
+			switch f.type_.(type) {
+			case *dwarfPtrType:
+				log.Fatalf("unaligned type %s has a pointer in it", typ.Name())
+			case *dwarfIfaceType:
+				log.Fatalf("unaligned type %s has an iface in it", typ.Name())
+			case *dwarfEfaceType:
+				log.Fatalf("unaligned type %s has an eface in it", typ.Name())
+			}
+		}
+		return
+	}
+	s := d.Ft(obj).GCSig
+	start /= d.PtrSize
+	if start < uint64(len(s)) {
+		s = s[start:]
+	} else {
+		s = ""
+	}
+	end := typ.Size() / d.PtrSize
+	if end < uint64(len(s)) {
+		s = s[:end]
+	}
+	// TODO: figure out how to check arrays.  Right now we only check one T at the target of any *T,
+	// but for slices we should check lots of T (up to the capacity of the slice).
+	n := 0
+	for _, f := range typ.dwarfFields() {
+		off := f.offset/d.PtrSize
+		switch f.type_.(type) {
+		case *dwarfPtrType:
+			if off >= uint64(len(s)) || s[off] != 'P' {
+				log.Fatalf("dwarf type %s has pointer @ %d, gc type %s does not", typ.Name(), off, s)
+			}
+			n++
+		case *dwarfIfaceType:
+			if off >= uint64(len(s)-1) || s[off] != 'I' && s[off+1] != 'I' {
+				log.Fatalf("dwarf type %s has iface, gc type %s does not", typ.Name(), s)
+			}
+			n+=2
+		case *dwarfEfaceType:
+			if off >= uint64(len(s)-1) && s[off] != 'E' && s[off+1] != 'E' {
+				log.Fatalf("dwarf type %s has eface, gc type %s does not", typ.Name(), s)
+			}
+			n+=2
+		}
+	}
+	for _, c := range s {
+		if c == 'P' || c == 'I' || c == 'E' {
+			n--
+		}
+	}
+	if n != 0 {
+		log.Printf("dwarf type %s has a different number of pointers than gc type %s", typ.Name(), s)
+	}
 }
 
 type nameType struct {
@@ -1765,78 +1832,6 @@ type nameType struct {
 func nameWithDwarf(d *Dump, execname string) {
 	w := getDwarf(execname)
 	t := dwarfTypeMap(d, w)
-
-	// name fields in all types
-	m := make(map[string]dwarfType)
-	for _, x := range t {
-		m[x.Name()] = x
-	}
-	for _, t := range d.Types {
-		dt := m[t.Name]
-		if dt == nil {
-			// A type in the dump has no entry in the Dwarf info.
-			// This can happen for unexported types, e.g. reflect.ptrGC.
-			//log.Printf("type %s has no dwarf info", t.Name)
-			continue
-		}
-		// Check that the Dwarf type is consistent with the type we got from
-		// the heap dump.  The heap dump type is the root truth, but it is
-		// missing non-pointer-bearing fields and has no field names.  If the
-		// Dwarf type is consistent with the heap dump type, then we'll use
-		// the fields from the Dwarf type instead.
-		consistent := true
-
-		// load Dwarf fields into layout
-		df := dt.Fields()
-		log.Print(df)
-		layout := make(map[uint64]Field)
-		for _, f := range df {
-			layout[f.Offset] = f
-		}
-		log.Print(layout)
-		log.Print(t.Fields)
-		// A field in the heap dump must match the corresponding Dwarf field
-		// in both kind and offset.
-		for _, f := range t.Fields {
-			if layout[f.Offset].Kind != f.Kind {
-				log.Printf("dwarf field kind doesn't match dump kind %s.%d dwarf=%d dump=%d", t.Name, f.Offset, layout[f.Offset].Kind, f.Kind)
-				consistent = false
-			}
-			delete(layout, f.Offset)
-		}
-		// all remaining fields must not be pointer-containing
-		for _, f := range layout {
-			switch f.Kind {
-			case FieldKindPtr, FieldKindIface, FieldKindEface:
-				log.Printf("dwarf type has additional ptr field %s %d %d", f.Name, f.Offset, f.Kind)
-				consistent = false
-			}
-		}
-		if consistent {
-			// Dwarf info looks good, overwrite the fields from the dump
-			// with fields from the Dwarf info.
-			t.Fields = df
-		} else {
-			log.Print("inconsistent type for ", t.Name)
-		}
-	}
-
-	// link up frames in sequence
-	// TODO: already do this later in link
-	frames := make(map[frameKey]*StackFrame, len(d.Frames))
-	for _, x := range d.Frames {
-		frames[frameKey{x.Addr, x.Depth}] = x
-	}
-	for _, f := range d.Frames {
-		if f.Depth == 0 {
-			continue
-		}
-		g := frames[frameKey{f.childaddr, f.Depth - 1}]
-		g.Parent = f
-	}
-	for _, g := range d.Goroutines {
-		g.Bos = frames[frameKey{g.bosaddr, 0}]
-	}
 
 	// name all frame fields
 	layouts := frameLayouts(d, w, t)
@@ -1857,7 +1852,7 @@ func nameWithDwarf(d *Dump, execname string) {
 			if c != nil {
 				_, ok := layouts[c.Name]
 				if !ok {
-					log.Printf("no locals layout for %s", r.Name)
+					log.Printf("no locals layout for %s", c.Name)
 				}
 				for _, arg := range layouts[c.Name].args {
 					for _, f := range arg.type_.dwarfFields() {
@@ -1869,9 +1864,11 @@ func nameWithDwarf(d *Dump, execname string) {
 			for i, f := range r.Fields {
 				v, ok := vars[f.Offset]
 				if !ok {
-					// unknown, for whatever reason
-					log.Printf("unknown field in %s @ %d", r.Name, f.Offset)
+					// Live ptr variable in frame has no dwarf type.  This seems to happen
+					// for autotemps which get suppressed by the dwarf generator.
+					//log.Printf("unknown field in %s @ %d (framesize=%d)", r.Name, f.Offset, len(r.Data))
 					r.Fields[i].Name = fmt.Sprintf("~%d", f.Offset)
+					r.Fields[i].BaseType = "&lt;unknown&gt;"
 					continue
 				}
 				r.Fields[i].Name = v.name
@@ -1881,7 +1878,7 @@ func nameWithDwarf(d *Dump, execname string) {
 		}
 	}
 
-	// naming for globals
+	// name all globals
 	gm := map[uint64]nameType{}
 	for _, g := range globalRoots(d, w, t) {
 		for _, f := range g.type_.dwarfFields() {
