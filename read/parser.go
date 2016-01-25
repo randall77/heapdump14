@@ -516,8 +516,8 @@ func rawRead(filename string) *Dump {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if prefix || string(hdr) != "go1.4 heap dump" {
-		log.Fatal("not a go1.4 heap dump file")
+	if prefix || (string(hdr) != "go1.4 heap dump" && string(hdr) != "go1.5 heap dump" && string(hdr) != "go1.6 heap dump") {
+		log.Fatal("not a go1.[456] heap dump file")
 	}
 
 	var d Dump
@@ -1703,7 +1703,7 @@ func setType(pc *propagateContext, addr uint64, typ dwarfType) {
 	if addr+typ.Size() > d.Addr(obj)+d.Size(obj) {
 		log.Fatalf("dwarf type larger than object addr=%x typ=%s typsize=%x objaddr=%x objsize=%x", addr, typ.Name(), typ.Size(), d.Addr(obj), d.Size(obj))
 	}
-	
+
 	checkType(d, addr, typ)
 
 	if oldtyp, ok := pc.htypes[addr]; ok {
@@ -1742,7 +1742,7 @@ func checkType(d *Dump, addr uint64, typ dwarfType) {
 	obj := d.FindObj(addr)
 
 	start := addr - d.Addr(obj)
-	if start % d.PtrSize != 0 {
+	if start%d.PtrSize != 0 {
 		// not aligned to a pointer - shouldn't contain any pointers
 		for _, f := range typ.dwarfFields() {
 			switch f.type_.(type) {
@@ -1771,7 +1771,7 @@ func checkType(d *Dump, addr uint64, typ dwarfType) {
 	// but for slices we should check lots of T (up to the capacity of the slice).
 	n := 0
 	for _, f := range typ.dwarfFields() {
-		off := f.offset/d.PtrSize
+		off := f.offset / d.PtrSize
 		switch f.type_.(type) {
 		case *dwarfPtrType:
 			if off >= uint64(len(s)) || s[off] != 'P' {
@@ -1782,12 +1782,12 @@ func checkType(d *Dump, addr uint64, typ dwarfType) {
 			if off >= uint64(len(s)-1) || s[off] != 'I' && s[off+1] != 'I' {
 				log.Fatalf("dwarf type %s has iface, gc type %s does not", typ.Name(), s)
 			}
-			n+=2
+			n += 2
 		case *dwarfEfaceType:
 			if off >= uint64(len(s)-1) && s[off] != 'E' && s[off+1] != 'E' {
 				log.Fatalf("dwarf type %s has eface, gc type %s does not", typ.Name(), s)
 			}
-			n+=2
+			n += 2
 		}
 	}
 	for _, c := range s {
