@@ -626,6 +626,29 @@ func rawRead(filename string) *Dump {
 			readUint64(r) // continpc
 			t.Name = readString(r)
 			t.Fields = readFields(r)
+			if t.Name == "runtime.goexit" {
+				// This is the function that "lives" at the top of stack.
+				// It isn't really there, however.  It is just the
+				// return address used by the outermost function of the
+				// goroutine.  It is just an assembly stub that calls
+				// back into the runtime to deallocate the goroutine.
+
+				// When the outermost goroutine function has arguments,
+				// the dumper attributes them to runtime.goexit.  They
+				// aren't really there, however.   More specifically,
+				// they don't live in the outargs section of goexit's
+				// frame.  They don't live in a frame, they are at the
+				// top of the goroutine stack in their own little section.
+
+				// runtime.goexit's "frame" is only one word in size,
+				// attributing the goroutine's arguments to it causes
+				// a failure trying to read those arguments out of
+				// the tiny frame.
+
+				// TODO: No frame is responsible for the goroutine's
+				// arguments.  How do we account for those roots?
+				t.Fields = nil
+			}
 			d.Frames = append(d.Frames, t)
 		case tagParams:
 			if readUint64(r) == 0 {
